@@ -1,630 +1,690 @@
-# ------------------------------------------------------------------------
-# Conditional DETR model and criterion classes.
-# Copyright (c) 2021 Microsoft. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# ------------------------------------------------------------------------
-
-import math
+from utils.misc import (accuracy)
+from utils.segment_ops import segment_cw_to_t1t2,segment_iou
+import torch.nn as nn
 import torch
 import torch.nn.functional as F
-from torch import nn
-import logging
 
-from utils.misc import (NestedTensor, nested_tensor_from_tensor_list, inverse_sigmoid)
+def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example. [bs,num_queries,num_classes]
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs. [bs,num_queries,num_classes]
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+    Returns:
+        Loss tensor
+    """
+    prob = inputs.sigmoid() # [bs,num_queries,num_classes]
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets) # [bs,num_queries,num_classes]
+    loss = ce_loss * ((1 - p_t) ** gamma)
 
-from .backbone import build_backbone
-from .matcher import build_matcher
-from .transformer import build_transformer
-from .criterion import build_criterion
-from .postprocess import build_postprocess
-from models.clip import build_text_encoder
-from .refine_decoder import build_refine_decoder
-from models.clip import clip as clip_pkg
-import torchvision.ops.roi_align as ROIalign
-import numpy as np
-import os
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
 
-logger = logging.getLogger()
+    return loss.mean(1).sum() / num_boxes 
 
-
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
-
-
-class ConditionalDETR(nn.Module):
-    """ This is the Conditional DETR module that performs object detection """
-    def __init__(self, 
-                 backbone, 
-                 transformer, 
-                 text_encoder, 
-                 refine_decoder,
-                 logit_scale, 
-                 device, 
-                 num_classes,
-                 args):
-        """ Initializes the model.
+class SetCriterion(nn.Module):
+    """ This class computes the loss for Conditional DETR.
+    The process happens in two steps:
+        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+    def __init__(self, num_classes, matcher, weight_dict,focal_alpha, args, base_losses=['labels', 'boxes']):
+        """ Create the criterion.
         Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            text_encoder: text_encoder from CLIP model. See clip.__init__.py
-            logit_scale: the logit_scale of CLIP. See clip.__init__.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
-                         Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
-            target_type: use one-hot or text as target. [none,prompt,description]
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-            norm_embed: Just for the similarity compute of CLIP visual and text embedding, following the CLIP setting
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            base_losses: list of all the losses to be applied. See get_loss for list of available losses.
+            focal_alpha: alpha in Focal Loss
+            gamma: gamma in Focal Loss
         """
         super().__init__()
-        self.backbone = backbone
-        self.transformer = transformer
-        self.text_encoder = text_encoder
-        self.logit_scale = logit_scale
-        self.device = device
         self.num_classes = num_classes
-        self.args = args
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.focal_alpha = focal_alpha
+        self.gamma = args.gamma
 
-        self.num_queries = args.num_queries
-        self.target_type = args.target_type
-        self.aux_loss = args.aux_loss
-        self.norm_embed = args.norm_embed
-        self.exp_logit_scale = args.exp_logit_scale
-       
-        self.ROIalign_strategy = args.ROIalign_strategy
-        self.ROIalign_size = args.ROIalign_size
-        
-        self.pooling_type = args.pooling_type
-
-        self.eval_proposal = args.eval_proposal 
-
-        self.actionness_loss = args.actionness_loss
+        self.actionness_loss = args.actionness_loss 
+        self.eval_proposal = args.eval_proposal
         self.enable_classAgnostic = args.enable_classAgnostic
 
-
-        self.enable_refine = args.enable_refine
-        self.enable_posPrior = args.enable_posPrior
-
         self.salient_loss = args.salient_loss
+        self.salient_loss_impl = args.salient_loss_impl
 
-        hidden_dim = transformer.d_model
-        self.inst_dim = hidden_dim // 2
-        self.boundary_dim = hidden_dim // 4
 
-        self.inst_content_embed = nn.Embedding(self.num_queries, self.inst_dim)
-        self.start_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
-        self.end_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
-
-        self.inst_bbox_embed = MLP(self.inst_dim, self.inst_dim, 2, 3)
-        self.start_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
-        self.end_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
-        # init bbox_mebed
-        nn.init.constant_(self.inst_bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.inst_bbox_embed.layers[-1].bias.data, 0)
-        nn.init.constant_(self.start_bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.start_bbox_embed.layers[-1].bias.data, 0)
-        nn.init.constant_(self.end_bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.end_bbox_embed.layers[-1].bias.data, 0)
-        
-        if self.enable_refine:
-            self.refine_decoder = refine_decoder
-
-        self.query_pos = nn.Embedding(self.num_queries, 2)
-        self.query_pos.weight.data[:, :1].uniform_(0, 1)
-        self.query_pos.weight.data[:, 1:2].fill_(0.2)
-        self.query_pos.weight.data = inverse_sigmoid(self.query_pos.weight.data.clamp(1e-6, 1 - 1e-6))
-
-        
-        self.input_proj = nn.Conv1d(backbone.feat_dim, hidden_dim, kernel_size=1)
-        
-        if self.target_type != "none":
-            self.class_embed = nn.Linear(hidden_dim, hidden_dim)
-            # init prior_prob setting for focal loss
-            prior_prob = 0.01
-            bias_value = -math.log((1 - prior_prob) / prior_prob)
-            self.class_embed.bias.data = torch.ones(hidden_dim) * bias_value
-
+        if self.eval_proposal or self.enable_classAgnostic:
+            self.base_losses = ['boxes','actionness']
+        elif self.actionness_loss:
+            self.base_losses = ['labels','actionness','boxes']
         else:
-            if not self.enable_classAgnostic or not self.eval_proposal:
-                self.class_embed = nn.Linear(hidden_dim, num_classes)
-                # init prior_prob setting for focal loss
-                prior_prob = 0.01
-                bias_value = -math.log((1 - prior_prob) / prior_prob)
-                self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+            self.base_losses = ['labels', 'boxes']
 
-        if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
-            self.actionness_embed = nn.Linear(hidden_dim,1)
-            # init prior_prob setting for focal loss
-            prior_prob = 0.01
-            bias_value = -math.log((1 - prior_prob) / prior_prob)
-            self.actionness_embed.bias.data = torch.ones(1) * bias_value
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'class_logits' in outputs
+        src_logits = outputs['class_logits'] # [bs,num_queries,num_classes]
+
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        target_classes_o = torch.cat([t["semantic_labels"][J] for t, (_, J) in zip(targets, indices)]) # [batch_target_class_id]
+        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[2],
+                                    dtype=torch.int64, device=src_logits.device) # [bs,num_queries]
+        target_classes[idx] = target_classes_o # [bs,num_queries]
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device) # [bs,num_queries,num_classes+1]
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:,:,:-1] # [bs,num_queries,num_classes]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma) * src_logits.shape[1]
+        losses = {'loss_ce': loss_ce}
+
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0] # [batch_matched_queries,num_classes]
+        return losses
+
+    def loss_complete_labels(self, outputs, targets, indices, num_boxes, log=True):
+        """
+        Modify the loss_labels, consider the complete of proposal semantic, introding the bg instance in matching stage
+        """
+        assert 'class_logits' in outputs
+        src_logits = outputs['class_logits'] # [bs,num_queries,num_classes+1]
+
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        target_classes_o = torch.cat([t["semantic_labels"][J] for t, (_, J) in zip(targets, indices)]) # [batch_target_class_id]
+        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[2]-1,
+                                    dtype=torch.int64, device=src_logits.device) # [bs,num_queries]
+        target_classes[idx] = target_classes_o # [bs,num_queries]
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device) # [bs,num_queries,num_classes+1]
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
 
-        if self.salient_loss:
-            self.salient_head = nn.Sequential(
-                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-                nn.LeakyReLU(0.2),
-                nn.Conv1d(hidden_dim, 1, kernel_size=1)
-            )
+        complete_classes_onehot = target_classes_onehot[idx] # [batch_matched_queries,num_classes+1]
+        complete_logits = src_logits[idx] # [batch_matched_queries,num_classes+1]
 
-        if self.target_type != "none":
-            logger.info(f"The target_type is {self.target_type}, using text embedding as target, on task: {args.task}!")
-        else:
-            logger.info(f"The target_type is {self.target_type}, using one-hot coding as target, must in close_set!")
+        loss_ce = sigmoid_focal_loss(complete_logits, complete_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma)
+        losses = {'loss_ce': loss_ce}
 
-    def get_text_feats(self, cl_names, description_dict, device, target_type):
-        def get_prompt(cl_names):
-            temp_prompt = []
-            for c in cl_names:
-                temp_prompt.append("a video of a person doing"+" "+c)
-            return temp_prompt
-        
-        def get_description(cl_names):
-            temp_prompt = []
-            for c in cl_names:
-                temp_prompt.append(description_dict[c]['Elaboration']['Description'][0]) # NOTE: default the idx of description is 0.
-            return temp_prompt
-        
-        if target_type == 'prompt':
-            act_prompt = get_prompt(cl_names)
-        elif target_type == 'description':
-            act_prompt = get_description(cl_names)
-        elif target_type == 'name':
-            act_prompt = cl_names
-        else: 
-            raise ValueError("Don't define this text_mode.")
-        
-        tokens = clip_pkg.tokenize(act_prompt).long().to(device) # input_ids->input_ids:[150,length]
-        text_feats = self.text_encoder(tokens).float()
+        return losses
 
-        return text_feats
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "segments" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        src_boxes = outputs['pred_boxes'][idx] # [batch_matched_queries,2]
+        target_boxes = torch.cat([t['segments'][i] for t, (_, i) in zip(targets, indices)], dim=0) # [batch_target,2]
 
-    def _to_roi_align_format(self, rois, truely_length, scale_factor=1):
-        '''Convert RoIs to RoIAlign format.
-        Params:
-            RoIs: normalized segments coordinates, shape (batch_size, num_segments, 2)
-            T: length of the video feature sequence
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(segment_iou(
+            segment_cw_to_t1t2(src_boxes).clamp(min=0,max=1), 
+            segment_cw_to_t1t2(target_boxes))) # the clamp is to deal with the case "center"-"width/2" < 0 and "center"+"width/2" < 1
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
+    def loss_boxes_refine(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "segments" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        src_boxes = outputs['pred_boxes'][idx] # [batch_matched_queries,2]
+        target_boxes = torch.cat([t['segments'][i] for t, (_, i) in zip(targets, indices)], dim=0) # [batch_target,2]
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox_refine'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(segment_iou(
+            segment_cw_to_t1t2(src_boxes).clamp(min=0,max=1), 
+            segment_cw_to_t1t2(target_boxes))) # the clamp is to deal with the case "center"-"width/2" < 0 and "center"+"width/2" < 1
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
+
+    def loss_exclusive(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "segments" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+
+        matched2all_iou_list = []
+        for batch_id, (query_id_list,_) in enumerate(indices):
+            batch_pred_boxes = outputs['pred_boxes'][batch_id] # [num_query,2]
+            batch_iou = segment_iou(
+            segment_cw_to_t1t2(batch_pred_boxes).clamp(min=0,max=1), 
+            segment_cw_to_t1t2(batch_pred_boxes).clamp(min=0,max=1)
+            ) # [num_query,num_query]
+            diag = torch.diag(batch_iou)
+            a_diag = torch.diag_embed(diag)
+            batch_iou = batch_iou - a_diag
+
+            matched2all_iou = batch_iou[query_id_list] # [matched_query,num_query]
+            matched2all_iou_list.append(matched2all_iou)
+
+        batch_matched2all_iou = torch.cat(matched2all_iou_list,dim=0) # [batch_matched2all, num_query]
+        loss_exclusive = batch_matched2all_iou.mean()
+        losses = {}
+        losses['loss_exclusive'] = loss_exclusive
+        return losses
+
+    def loss_exclusive_v2(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "segments" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+
+        all_iou_list = []
+        for batch_id, (query_id_list,_) in enumerate(indices):
+            batch_pred_boxes = outputs['pred_boxes'][batch_id] # [num_query,2]
+            batch_iou = segment_iou(
+            segment_cw_to_t1t2(batch_pred_boxes).clamp(min=0,max=1), 
+            segment_cw_to_t1t2(batch_pred_boxes).clamp(min=0,max=1)
+            ) # [num_query,num_query]
+            diag = torch.diag(batch_iou)
+            a_diag = torch.diag_embed(diag)
+            batch_iou = batch_iou - a_diag
+
+            all_iou_list.append(batch_iou)
+
+        all_iou_list = torch.cat(all_iou_list,dim=0) # [all_iou_list, num_query]
+        loss_exclusive = all_iou_list.mean()
+        losses = {}
+        losses['loss_exclusive'] = 0.5*loss_exclusive
+        return losses
+
+    def loss_segmentations(self,outputs, targets, indices, num_boxes):
         '''
-        # transform to absolute axis
-        B, N = rois.shape[:2]
-        rois_center = rois[:, :, 0:1] # [B,N,1]
-        rois_size = rois[:, :, 1:2] * scale_factor # [B,N,1]
-        truely_length = truely_length.reshape(-1,1,1) # [B,1,1]
-        rois_abs = torch.cat(
-            (rois_center - rois_size/2, rois_center + rois_size/2), dim=2) * truely_length # [B,N,2]->"start,end"
-        # expand the RoIs
-        _max = truely_length.repeat(1,N,2)
-        _min = torch.zeros_like(_max)
-        rois_abs = torch.clamp(rois_abs, min=_min, max=_max)  # (B, N, 2)
-        # transfer to 4 dimension coordination
-        rois_abs_4d = torch.zeros((B,N,4),dtype=rois_abs.dtype,device=rois_abs.device)
-        rois_abs_4d[:,:,0], rois_abs_4d[:,:,2] = rois_abs[:,:,0], rois_abs[:,:,1] # x1,0,x2,0
-
-        # add batch index
-        batch_ind = torch.arange(0, B).view((B, 1, 1)).to(rois_abs.device) # [B,1,1]
-        batch_ind = batch_ind.repeat(1, N, 1) # [B,N,1]
-        rois_abs_4d = torch.cat((batch_ind, rois_abs_4d), dim=2) # [B,N,1+4]->"batch_id,x1,0,x2,0"
-        # NOTE: stop gradient here to stablize training
-        return rois_abs_4d.view((B*N, 5)).detach()
-
-    def _roi_align(self, rois, origin_feat, mask, ROIalign_size, scale_factor=1):
-        B,Q,_ = rois.shape
-        B,T,C = origin_feat.shape
-        truely_length = T-torch.sum(mask,dim=1) # [B]
-        rois_abs_4d = self._to_roi_align_format(rois,truely_length,scale_factor)
-        feat = origin_feat.permute(0,2,1) # [B,dim,T]
-        feat = feat.reshape(B,C,1,T)
-        roi_feat = ROIalign(feat, rois_abs_4d, output_size=(1,ROIalign_size))
-        roi_feat = roi_feat.reshape(B,Q,C,-1) # [B,Q,dim,output_width]
-        roi_feat = roi_feat.permute(0,1,3,2) # [B,Q,output_width,dim]
-        return roi_feat
-
-    # @torch.no_grad()
-    def _compute_similarity(self, visual_feats, text_feats):
+        for dense prediction, which is like to maskformer, the loss compute on the memory of the output of encoder
+        segmentation_logits: the output of segmentation_logits => [B,T,num_classes]
+        feature_list: the feature list after backbone for temporal modeling => list[NestedTensor]
         '''
-        text_feats: [num_classes,dim]
-        '''
-        if len(visual_feats.shape)==2: # batch_num_instance,dim
-            if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
-                if self.exp_logit_scale:
-                    logit_scale = self.logit_scale.exp()
-                else:
-                    logit_scale = self.logit_scale
-                logits = torch.einsum("bd,cd->bc",visual_feats,text_feats)*logit_scale
-            else:
-                logits = torch.einsum("bd,cd->bc",visual_feats,text_feats)
-            return logits
-        elif len(visual_feats.shape)==3:# batch,num_queries/snippet_length,dim
-            if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
-                if self.exp_logit_scale:
-                    logit_scale = self.logit_scale.exp()
-                else:
-                    logit_scale = self.logit_scale
-                logits = torch.einsum("bqd,cd->bqc",visual_feats,text_feats)*logit_scale
-            else:
-                logits = torch.einsum("bqd,cd->bqc",visual_feats,text_feats)
-            return logits
-        elif len(visual_feats.shape)==4:# batch,num_queries,snippet_length,dim
-            if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
-                if self.exp_logit_scale:
-                    logit_scale = self.logit_scale.exp()
-                else:
-                    logit_scale = self.logit_scale
-                logits = torch.einsum("bqld,cd->bqlc",visual_feats,text_feats)*logit_scale
-            else:
-                logits = torch.einsum("bqld,cd->bqlc",visual_feats,text_feats)
-            return logits
+        # assert 'segmentation_logits' in outputs
+        # assert 'segmentation_onehot_labels' in targets[0]
+
+        # # obtain logits
+        # segmentation_logits = outputs['segmentation_logits'] # [B,T,num_classes]
+        # B,T,C = segmentation_logits.shape
+
+        # # prepare labels
+        # segmentation_onehot_labels_pad = torch.zeros_like(segmentation_logits) # [B,T,num_classes], zero in padding region
+        # for i, tgt in enumerate(targets):
+        #     feat_length = tgt['segmentation_onehot_labels'].shape[0]
+        #     segmentation_onehot_labels_pad[i,:feat_length,:] = tgt['segmentation_onehot_labels'] # [feat_length, num_classes]
+
+        # ce_loss = -(segmentation_onehot_labels_pad * F.log_softmax(segmentation_logits, dim=-1)).sum(dim=-1)
+
+        # losses = {}
+        # losses['loss_segmentation'] = ce_loss.sum(-1).sum() / B
+
+        assert 'segmentation_logits' in outputs
+        assert 'segmentation_labels' in targets[0]
+        assert 'logits_mask' in outputs
+
+        # obtain logits
+        segmentation_logits = outputs['segmentation_logits'] # [B,T,num_classes+1]
+        B,T,C = segmentation_logits.shape
+
+        # prepare labels
+        segmentation_labels_pad = torch.full(segmentation_logits.shape[:2], segmentation_logits.shape[2]-1, dtype=torch.int64, device=segmentation_logits.device) # [B,T]
+        for i, tgt in enumerate(targets):
+            feat_length = tgt['segmentation_labels'].shape[0]
+            segmentation_labels_pad[i,:feat_length] = tgt['segmentation_labels'] # [feat_length]
+
+        target_classes_onehot = torch.zeros_like(segmentation_logits) # [bs,T,num_classes+1]
+        target_classes_onehot.scatter_(2, segmentation_labels_pad.unsqueeze(-1), 1)
         
-        else:
-            raise NotImplementedError
 
-     
-    def _temporal_pooling(self,pooling_type,coordinate,clip_feat,mask,ROIalign_size,text_feats):
-        b,t,_ = coordinate.shape
-        if pooling_type == "average":
-            roi_feat = self._roi_align(rois=coordinate,origin_feat=clip_feat+1e-4,mask=mask,ROIalign_size=ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            # roi_feat = roi_feat.mean(-2) # [B,Q,dim]
-            if self.ROIalign_strategy == "before_pred":
-                roi_feat = roi_feat.mean(-2) # [B,Q,dim]
-                ROIalign_logits = self._compute_similarity(roi_feat,text_feats) # [b,Q,num_classes]
-            elif self.ROIalign_strategy == "after_pred":
-                roi_feat = roi_feat # [B,Q,L,dim]
-                ROIalign_logits = self._compute_similarity(roi_feat,text_feats) # [b,Q,L,num_classes]
-                ROIalign_logits = ROIalign_logits.mean(-2) # [B,Q,num_classes]
-            else:
-                raise NotImplementedError
-        elif pooling_type == "max":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            roi_feat = roi_feat.max(dim=2)[0] # [bs,num_queries,dim]
+        prob = segmentation_logits.sigmoid() # [batch_instance_num,num_classes]
+        ce_loss = F.binary_cross_entropy_with_logits(segmentation_logits, target_classes_onehot, reduction="none")
+        p_t = prob * target_classes_onehot + (1 - prob) * (1 - target_classes_onehot) # [bs,T,num_classes+1]
+        loss = ce_loss * ((1 - p_t) ** 2)
+        alpha = 0.25
+        if alpha >= 0:
+            alpha_t = alpha * target_classes_onehot + (1 - alpha) * (1 - target_classes_onehot)
+            loss = alpha_t * loss
 
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
-        elif pooling_type == "center1":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            center_idx = int(roi_feat.shape[2] / 2)
-            roi_feat = roi_feat[:,:,center_idx,:] 
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
-        elif pooling_type == "center2":
-            rois = coordinate # [b,n,2]
-            rois_center = rois[:, :, 0:1] # [B,N,1]
-            # rois_size = rois[:, :, 1:2] * scale_factor # [B,N,1]
-            truely_length = t-torch.sum(mask,dim=1) # [B]
-            truely_length = truely_length.reshape(-1,1,1) # [B,1,1]
-            center_idx = (rois_center*truely_length).long() # [b,n,1]
-            roi_feat = torch.gather(clip_feat + 1e-4, dim=1, index=center_idx.expand(-1, -1, clip_feat.shape[-1]))
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
-        elif pooling_type == "self_attention":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            attention_weights = F.softmax(torch.matmul(roi_feat, roi_feat.transpose(-2, -1)), dim=-1)
-            roi_feat_sa = torch.matmul(attention_weights, roi_feat)
-            roi_feat_sa = roi_feat_sa.mean(2)
-            ROIalign_logits = self._compute_similarity(roi_feat_sa,text_feats)
-        elif pooling_type == "slow_fast":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            fast_feat = roi_feat.mean(dim=2) # [b,q,d]
-            step = int(self.ROIalign_size // 4)
-            slow_feat = roi_feat[:,:,::step,:].mean(dim=2) # [b,q,d]
-            roi_feat_final = (fast_feat + slow_feat)/2
-            ROIalign_logits = self._compute_similarity(roi_feat_final,text_feats)
-        elif pooling_type == "sparse":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            step = int(self.ROIalign_size // 4)
-            slow_feat = roi_feat[:,:,::step,:].mean(dim=2) # [b,q,d]
-            ROIalign_logits = self._compute_similarity(slow_feat,text_feats)
+        logits_mask = ~outputs['logits_mask'] # covert False to 1
+        loss = torch.einsum("btc,bt->btc",loss,logits_mask) # [b,t,c+1]
+
+        losses = {}
+        losses['loss_segmentation'] = loss.sum(-1).mean()
+        return losses
+
+    def loss_instances(self,outputs, targets, indices, num_boxes):
+        '''
+        for instance prediction, modeling the relation of instance region and text 
+        instance_logits: the output of instance_logits => [batch_instance_num,num_classes]
+        '''
+        assert 'instance_logits' in outputs
+ 
+        # obtain logits
+        instance_logits = outputs['instance_logits'] #[batch_instance_num,num_classes]
+        B,C = instance_logits.shape
+
+        instance_gt = [] 
+        for t in targets:
+            gt_labels = t['labels'] # [num_instance]
+            instance_gt.append(gt_labels)
+        instance_gt = torch.cat(instance_gt,dim=0) # [batch_instance_num]->"class id"
+        
+        # prepare labels
+        target_classes_onehot = torch.zeros_like(instance_logits) # [batch_instance_num,num_classes]
+        target_classes_onehot.scatter_(1, instance_gt.reshape(-1,1), 1) # [batch_instance_num,num_classes]
+
+        if self.instance_loss_type == "CE":
+            loss = -(target_classes_onehot * F.log_softmax(instance_logits, dim=-1)).sum(dim=-1)
+        elif self.instance_loss_type == "BCE":
+            prob = instance_logits.sigmoid() # [batch_instance_num,num_classes]
+            ce_loss = F.binary_cross_entropy_with_logits(instance_logits, target_classes_onehot, reduction="none")
+            p_t = prob * target_classes_onehot + (1 - prob) * (1 - target_classes_onehot) # [bs,num_queries,num_classes]
+            loss = ce_loss * ((1 - p_t) ** 2)
+            alpha = 0.25
+            if alpha >= 0:
+                alpha_t = alpha * target_classes_onehot + (1 - alpha) * (1 - target_classes_onehot)
+                loss = alpha_t * loss
         else:
             raise ValueError
+        losses = {}
+        losses['loss_instance'] = loss.mean()
+        return losses
 
-        return ROIalign_logits   
+    def loss_matching(self,outputs, targets, indices, num_boxes):
+        '''
+        for instance prediction, modeling the relation of instance region and text 
+        matching_logits: the output of matching_logits => [batch_instance_num,num_classes]
+        '''
+        assert 'matching_logits' in outputs
+ 
+        # obtain logits
+        matching_logits = outputs['matching_logits'] #[batch_instance_num,num_classes]
+        B,C = matching_logits.shape
 
-    def forward(self, samples: NestedTensor, classes_name, description_dict, targets, epoch):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched video, of shape [batch_size x T x C]
-               - samples.mask: a binary mask of shape [batch_size x T], containing 1 (i.e., true) on padded snippet
-            classes_name: the class name of involved category
-            description_dict: the dict of description file
-            targets: the targets that contain gt
-
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x num_classes]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center, width). These values are normalized in [0, 1],
-                               relative to the size of each individual video (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
-        """
-        if isinstance(samples, (list, torch.Tensor)):
-            samples = nested_tensor_from_tensor_list(samples)
-
-        # origin CLIP features
-        clip_feat, mask = samples.decompose()
-        bs,t,dim = clip_feat.shape
-
-        # backbone for temporal modeling
-        feature_list, pos = self.backbone(samples) # list of [b,t,c], list of [b,t,c]
-
-        # prepare text target
-        if self.target_type != "none":
-            with torch.no_grad():
-                if self.args.feature_type == "ViFi-CLIP":
-                    text_feats = torch.from_numpy(np.load(os.path.join(self.args.feature_path,'text_features_split75_splitID1.npy'))).float().to(self.device)
-                elif self.args.feature_type == "CLIP":
-                    text_feats = self.get_text_feats(classes_name, description_dict, self.device, self.target_type) # [N classes,dim]
-                else:
-                    raise NotImplementedError
-
-                
-        # feed into model
-        src, mask = feature_list[-1].decompose()
-        assert mask is not None
-        src = self.input_proj(src.permute(0,2,1)).permute(0,2,1)
-
-        inst_queries = self.inst_content_embed.weight
-        start_queries = self.start_content_embed.weight
-        end_queries = self.end_content_embed.weight
-
-        memory, inst_hs, start_hs, end_hs, reference, enc_dense_logits, enc_dense_boxes = self.transformer(
-            src,
-            mask,
-            (inst_queries, start_queries, end_queries),
-            self.query_pos.weight,
-            pos[-1],
-        )
-
-        # record result
-        out = {}
-        out['memory'] = memory
-        out['hs'] = torch.cat([inst_hs, start_hs, end_hs], dim=-1)
-        out['dense_class_logits'] = enc_dense_logits  # [bs, T, 1]
-        out['dense_pred_boxes'] = enc_dense_boxes  # [bs, T, 2]
-
-        # #  For computing ACC use ###
-        # # compute the classification accuate of CLIP
-        # # prepare instance coordination
-        # gt_roi_feat = [] 
-        # gt_labels = []
-        # for i, t in enumerate(targets):
-        #     if len(t['segments']) > 0 :
-        #         gt_coordinations = t['segments'].unsqueeze(0) # [1,num_instance,2]->"center,width"
-        #         visual_feat_i = clip_feat[i].unsqueeze(0) # [1,T,dim]
-        #         mask_i = mask[i].unsqueeze(0) # [1,T]
-        #         roi_feat = self._roi_align(gt_coordinations,visual_feat_i,mask_i,self.ROIalign_size).squeeze(dim=0) # [1,num_instance,ROIalign_size,dim]->[num_instance,ROIalign_size,dim]
-        #         gt_roi_feat.append(roi_feat)
-        #         gt_lbl = t['semantic_labels'] # [num]
-        #         gt_labels.append(gt_lbl)
-        # if len(gt_labels) > 0:
-        #     gt_roi_feat = torch.cat(gt_roi_feat,dim=0) # [batch_instance_num,ROIalign_size,dim]
-        #     gt_roi_feat = gt_roi_feat.mean(dim=1) # [batch_instance_num,dim]
-        #     gt_labels = torch.cat(gt_labels,dim=0) # [batch_instance_num]
-
-        #     gt_logits = self._compute_similarity(gt_roi_feat,text_feats) # [batch_instance_num,num_classes]
-            
-        #     out['gt_labels'] = gt_labels
-        #     out['gt_logits'] = gt_logits
-        # #  For computing ACC use ###
-
-        # generate the salient gt
-        if self.salient_loss:
-            if self.training: # only generate gt in training phase
-                salient_gt = torch.zeros((bs,t),device=self.device) # [bs,t]
-                salient_loss_mask = mask.clone() # [bs,t]
-
-                for i, tgt in enumerate(targets):
-                    salient_mask = tgt['salient_mask'] # [num_tgt,T]
-                    # padding the salient mask
-                    num_to_pad = t - salient_mask.shape[1]
-                    if num_to_pad > 0:
-                        padding = torch.ones((salient_mask.shape[0], num_to_pad), dtype=torch.bool, device=salient_mask.device)
-                        salient_mask = torch.cat((salient_mask, padding), dim=1)
-
-                    for salient_mask_j in salient_mask:
-                        salient_gt[i,:] = (salient_gt[i,:] + (~salient_mask_j).float()).clamp(0,1)
-
-
-                out['salient_gt'] = salient_gt
-                out['salient_loss_mask'] = salient_loss_mask
-            
-            salient_logits = self.salient_head(memory[-1].permute(0,2,1)).permute(0,2,1) # [b,t,1]
-            out['salient_logits'] = salient_logits
-
-        inst_feat = inst_hs[-1]
-        start_feat = start_hs[-1]
-        end_feat = end_hs[-1]
-        reference_before_sigmoid = inverse_sigmoid(reference)
-
-        inst_delta = self.inst_bbox_embed(inst_feat)
-        cw_logits = inst_delta + reference_before_sigmoid
-        cw_pred = cw_logits.sigmoid()
-
-        start_base = (cw_pred[..., :1] - cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
-        end_base = (cw_pred[..., :1] + cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
-
-        start_logits = inverse_sigmoid(start_base) + self.start_bbox_embed(start_feat)
-        end_logits = inverse_sigmoid(end_base) + self.end_bbox_embed(end_feat)
-
-        start_pred = start_logits.sigmoid()
-        end_pred = end_logits.sigmoid()
-        width_pred = (end_pred - start_pred).clamp(min=1e-6)
-        center_pred = ((end_pred + start_pred) / 2).clamp(0, 1)
-        pred_boxes = torch.cat([center_pred, width_pred], dim=-1)
-
-        fused_feat_last = torch.cat([inst_feat, start_feat, end_feat], dim=-1)
-
-        # refine encoder
-        if self.enable_refine:
-            with torch.no_grad():
-                roi_pos = self._roi_align(pred_boxes, pos[-1], mask,
-                                          self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
-                roi_feat = self._roi_align(pred_boxes, clip_feat, mask,
-                                           self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
-
-            b,q,l,d = roi_feat.shape
-            refine_hs = self.refine_decoder(fused_feat_last, clip_feat, roi_feat,
-                                    video_feat_key_padding_mask=mask,
-                                    video_pos=pos[-1],
-                                    roi_pos=roi_pos)
-
-            refine_hs = fused_feat_last + refine_hs
-            inst_refine, start_refine, end_refine = torch.split(refine_hs,
-                                                                [self.inst_dim, self.boundary_dim, self.boundary_dim],
-                                                                dim=-1)
-
-            inst_delta_refine = self.inst_bbox_embed(inst_refine)
-            cw_logits_refine = inst_delta_refine + reference_before_sigmoid
-            cw_pred_refine = cw_logits_refine.sigmoid()
-
-            start_base_refine = (cw_pred_refine[..., :1] - cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
-            end_base_refine = (cw_pred_refine[..., :1] + cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
-
-            start_logits_refine = inverse_sigmoid(start_base_refine) + self.start_bbox_embed(start_refine)
-            end_logits_refine = inverse_sigmoid(end_base_refine) + self.end_bbox_embed(end_refine)
-
-            start_pred_refine = start_logits_refine.sigmoid()
-            end_pred_refine = end_logits_refine.sigmoid()
-            width_pred_refine = (end_pred_refine - start_pred_refine).clamp(min=1e-6)
-            center_pred_refine = ((end_pred_refine + start_pred_refine) / 2).clamp(0, 1)
-
-            outputs_coord_refined = torch.cat([center_pred_refine, width_pred_refine], dim=-1)
-            out['pred_boxes'] = outputs_coord_refined
-
-            if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
-                # compute the class-agnostic foreground score
-                actionness_logits = self.actionness_embed(refine_hs) # [b,num_queries,2]
-                out['actionness_logits'] = actionness_logits
-
-            if not self.eval_proposal and not self.enable_classAgnostic:
-                if self.target_type != "none":
-                    class_emb = self.class_embed(refine_hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,dim]
-                    b,n,dim = class_emb.shape
-                    class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
-                else:
-                    class_logits = self.class_embed(refine_hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
-                out['class_logits'] = class_logits
-
-
-        else:
-            out['pred_boxes'] = pred_boxes
-
-            if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
-                # compute the class-agnostic foreground score
-                actionness_logits = self.actionness_embed(fused_feat_last)
-                out['actionness_logits'] = actionness_logits
+        instance_gt = [] 
+        for t in targets:
+            gt_labels = t['labels'] # [num_instance]
+            instance_gt.append(gt_labels)
+        instance_gt = torch.cat(instance_gt,dim=0) # [batch_instance_num]->"class id"
         
+        # prepare labels
+        target_classes_onehot = torch.zeros_like(matching_logits) # [batch_instance_num,num_classes]
+        target_classes_onehot.scatter_(1, instance_gt.reshape(-1,1), 1) # [batch_instance_num,num_classes]
 
-            if not self.eval_proposal and not self.enable_classAgnostic:
-                if self.target_type != "none":
-                    class_emb = self.class_embed(fused_feat_last)
-                    b,n,dim = class_emb.shape
-                    class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
-                else:
-                    class_logits = self.class_embed(fused_feat_last)
-                out['class_logits'] = class_logits
+        prob = matching_logits.sigmoid() # [batch_instance_num,num_classes]
+        ce_loss = F.binary_cross_entropy_with_logits(matching_logits, target_classes_onehot, reduction="none")
+        p_t = prob * target_classes_onehot + (1 - prob) * (1 - target_classes_onehot) # [bs,num_queries,num_classes]
+        loss = ce_loss * ((1 - p_t) ** 2)
+        alpha = 0.25
+        if alpha >= 0:
+            alpha_t = alpha * target_classes_onehot + (1 - alpha) * (1 - target_classes_onehot)
+            loss = alpha_t * loss
 
+        losses = {}
+        losses['loss_matching'] = loss.mean()
+        return losses
 
-        # obtain the ROIalign logits
-        if not self.training: # only in inference stage
-            
+    def loss_mask(self,outputs, targets, indices, num_boxes):
+        '''
+        for dense prediction, which is like to maskformer, the loss compute on the memory of the output of encoder
+        mask_logits: the output of mask_logits => [B,T,num_classes]
+        feature_list: the feature list after backbone for temporal modeling => list[NestedTensor]
+        '''
+        assert 'mask_logits' in outputs
+        assert 'mask_labels' in targets[0]
 
-            if self.enable_classAgnostic:
-                # fixed_text_feats = self.get_text_feats(classes_name, description_dict, self.device, self.target_type) # [N classes,dim]
+        # obtain logits
+        mask_logits = outputs['mask_logits'].squeeze(2) # [B,T,1]->[B,T]
+        B,T= mask_logits.shape
 
-                ROIalign_logits = self._temporal_pooling(self.pooling_type, out['pred_boxes'], clip_feat, mask, self.ROIalign_size, text_feats)
-                
-                out['class_logits'] = ROIalign_logits 
-            elif self.eval_proposal:
-                pass
-            else:
-                assert "class_logits" in out, "please check the code of self.class_embed"
-            
+        # prepare labels
+        mask_labels_pad = torch.zeros_like(mask_logits) # [B,T], zero in padding region
+        for i, tgt in enumerate(targets):
+            feat_length = tgt['mask_labels'].shape[0]
+            mask_labels_pad[i,:feat_length] = tgt['mask_labels'] # [feat_length]
 
-        return out
+        ce_loss = F.binary_cross_entropy_with_logits(mask_logits, mask_labels_pad, reduction="none").sum(-1) # [B,T]
 
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
-
-
-
-
-
-def build(args, device):
-    if args.target_type != "none": # adopt one-hot as target, only used in close_set
-        num_classes = int(args.num_classes * args.split / 100)
-    else:
-        num_classes = args.num_classes
-
-    if args.feature_type == "ViFi-CLIP":
-        text_encoder,logit_scale = None, torch.from_numpy(np.load(os.path.join(args.feature_path,'logit_scale.npy'))).float()
-    elif args.feature_type == "CLIP":
-        text_encoder, logit_scale = build_text_encoder(args,device)
-    else:
-        raise NotImplementedError
-    backbone = build_backbone(args)
-    transformer = build_transformer(args)
-
-    if args.enable_refine:
-        refine_decoder = build_refine_decoder(args)
-    else:
-        refine_decoder = None
-
-    model = ConditionalDETR(
-        backbone,
-        transformer,
-        text_encoder,
-        refine_decoder,
-        logit_scale,
-        device=device,
-        num_classes=num_classes,
-        args=args
-    )
-    matcher = build_matcher(args)
-
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
-    weight_dict['loss_dense_ce'] = args.cls_loss_coef
-    weight_dict['loss_dense_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_dense_giou'] = args.giou_loss_coef
+        losses = {}
+        losses['loss_mask'] = ce_loss.sum() / B
+        return losses
     
-    if args.actionness_loss or args.eval_proposal or args.enable_classAgnostic:
-        weight_dict['loss_actionness'] = args.actionness_loss_coef
-    if args.salient_loss:
-        weight_dict['loss_salient'] = args.salient_loss_coef
 
-    # TODO this is a hack
-    if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
-    
-    criterion = build_criterion(args, num_classes, matcher=matcher, weight_dict=weight_dict)
-    criterion.to(device)
+    def loss_actionness(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'actionness_logits' in outputs
+        src_logits = outputs['actionness_logits'] # [bs,num_queries,1]
 
-    postprocessor = build_postprocess(args)
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]) # [batch_target_class_id]
+        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[2],
+                                    dtype=torch.int64, device=src_logits.device) # [bs,num_queries]
+        target_classes[idx] = target_classes_o # [bs,num_queries]
 
-    return model, criterion, postprocessor
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device) # [bs,num_queries,num_classes+1]
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:,:,:-1] # [bs,num_queries,num_classes]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma) * src_logits.shape[1]
+        losses = {'loss_actionness': loss_ce}
+
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0] # [batch_matched_queries,num_classes]
+        return losses
+
+    def loss_actionness_refine(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'actionness_logits' in outputs
+        src_logits = outputs['actionness_logits'] # [bs,num_queries,1]
+
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]) # [batch_target_class_id]
+        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[2],
+                                    dtype=torch.int64, device=src_logits.device) # [bs,num_queries]
+        target_classes[idx] = target_classes_o # [bs,num_queries]
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device) # [bs,num_queries,num_classes+1]
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:,:,:-1] # [bs,num_queries,num_classes]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma) * src_logits.shape[1]
+        losses = {'loss_actionness_refine': loss_ce}
+
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0] # [batch_matched_queries,num_classes]
+        return losses
+
+
+
+    def loss_refine_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "segments" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        src_boxes = outputs['pred_boxes'][idx] # [batch_matched_queries,2]
+        target_boxes = torch.cat([t['segments'][i] for t, (_, i) in zip(targets, indices)], dim=0) # [batch_target,2]
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_refine_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(segment_iou(
+            segment_cw_to_t1t2(src_boxes).clamp(min=0,max=1), 
+            segment_cw_to_t1t2(target_boxes))) # the clamp is to deal with the case "center"-"width/2" < 0 and "center"+"width/2" < 1
+        losses['loss_refine_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
+    def loss_complete_actionness(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'actionness_logits' in outputs
+        src_logits = outputs['actionness_logits'] # [bs,num_queries,2]
+
+        idx = self._get_src_permutation_idx(indices) # (batch_idx,src_idx)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]) # [batch_target_class_id]
+        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[2]-1,
+                                    dtype=torch.int64, device=src_logits.device) # [bs,num_queries]
+        target_classes[idx] = target_classes_o # [bs,num_queries]
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device) # [bs,num_queries,num_classes+1]
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        # complete_classes_onehot = target_classes_onehot[idx] # [batch_matched_queries,num_classes+1]
+        # complete_logits = src_logits[idx] # [batch_matched_queries,num_classes+1]
+
+        # loss_ce = sigmoid_focal_loss(complete_logits, complete_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma)
+        # losses = {'loss_actionness': loss_ce}
+        
+        target_classes_onehot = target_classes_onehot[:,:,:] # [bs,num_queries,num_classes]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=self.gamma) * src_logits.shape[1]
+        losses = {'loss_actionness': loss_ce}
+
+        return losses
+
+
+    def loss_queryRelation(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'ROI_relation' in outputs
+        ROI_relation = outputs['ROI_relation'] # [bs*q,bs*q]
+        assert 'query_relation' in outputs
+        query_relation = outputs['query_relation'] # [bs*q,bs*q]
+
+        queryRelation_loss = F.l1_loss(query_relation,ROI_relation)
+
+
+        losses = {'loss_queryRelation': queryRelation_loss}
+
+        return losses
+
+    def loss_rank(self, outputs, targets, indices, num_boxes, log=True):
+        """
+            Rank loss, for fine-grained boundary perception
+            NOTE: If the num_queries is so small, can not cover all gt, an error will appear here
+        """
+        def rank_loss(center_logits, inner_logits, outer_logits, margin=0.3):
+            # 计算 pairwise ranking loss
+            center_logits = center_logits.sigmoid()
+            inner_logits = inner_logits.sigmoid()
+            outer_logits = outer_logits.sigmoid()
+
+            loss = torch.relu(margin + inner_logits - center_logits) + torch.relu(margin + outer_logits - inner_logits)
+            return loss.mean()
+        
+        assert 'actionness_logits' in outputs
+        src_logits = outputs['actionness_logits'] # [bs,num_queries,1]
+
+        batch_center_logits = []
+        batch_inner_logits = []
+        batch_outer_logits = []
+        for i, (src,tgt) in enumerate(indices):
+            batch_idx = torch.full_like(src[0::3],i) # [num_tgt]
+            src_idx = src # [num_tgt]
+            tgt_idx = tgt # [num_tgt]
+
+            sorted_pairs = sorted(zip(tgt_idx, src_idx))
+            sorted_tgt_idx, sorted_src_idx = zip(*sorted_pairs)
+            center_tgt, center_src = sorted_tgt_idx[0::3], sorted_src_idx[0::3]
+            inner_tgt, inner_src = sorted_tgt_idx[1::3], sorted_src_idx[1::3]
+            outer_tgt, outer_src = sorted_tgt_idx[2::3], sorted_src_idx[2::3]
+
+            center_logits = src_logits[(batch_idx,center_src)] # [num_tgt,1]
+            batch_center_logits.append(center_logits)
+            inner_logits = src_logits[(batch_idx,inner_src)] # [num_tgt,1]
+            batch_inner_logits.append(inner_logits)
+            outer_logits = src_logits[(batch_idx,outer_src)] # [num_tgt,1]
+            batch_outer_logits.append(outer_logits)
+
+        batch_center_logits = torch.cat(batch_center_logits,dim=0)
+        batch_inner_logits = torch.cat(batch_inner_logits,dim=0)
+        batch_outer_logits = torch.cat(batch_outer_logits,dim=0)
+        
+        loss_rank = rank_loss(batch_center_logits,batch_inner_logits,batch_outer_logits,margin=0.2)
+            
+        losses = {'loss_rank': loss_rank}
+
+        return losses
+
+    def loss_salient(self, outputs, targets, indices, num_boxes, log=True):
+        """
+            Rank loss, for fine-grained boundary perception
+            NOTE: If the num_queries is so small, can not cover all gt, an error will appear here
+        """
+
+        assert 'salient_logits' in outputs
+        assert 'salient_loss_mask' in outputs
+        assert 'salient_gt' in outputs
+        salient_logits = outputs['salient_logits'] # [bs,t,1]
+        salient_logits = salient_logits.squeeze(dim=2) # [bs,t]
+        mask = outputs['salient_loss_mask'] # [bs,t]
+        salient_gt = outputs['salient_gt'] # [bs,t]
+
+        if self.salient_loss_impl == "BCE":
+            prob = salient_logits.sigmoid() # [bs,t]
+            ce_loss = F.binary_cross_entropy_with_logits(salient_logits, salient_gt, reduction="none")
+            p_t = prob * salient_gt + (1 - prob) * (1 - salient_gt) # [bs,t]
+            loss = ce_loss * ((1 - p_t) ** self.gamma)
+
+            if self.focal_alpha >= 0:
+                alpha_t = self.focal_alpha * salient_gt + (1 - self.focal_alpha) * (1 - salient_gt)
+                loss = alpha_t * loss
+
+            un_mask = ~mask
+            loss_salient = loss*un_mask
+
+            loss_salient = loss_salient.mean(1).sum() / num_boxes 
+
+        elif self.salient_loss_impl == "CE":
+
+            salient_gt = salient_gt / (torch.sum(salient_gt, dim=1, keepdim=True) + 1e-4) # [b,t]
+
+            loss_salient = -(salient_gt * F.log_softmax(salient_logits, dim=-1)) # [b,t]
+            
+            un_mask = ~mask
+            loss_salient = loss_salient*un_mask
+            loss_salient = loss_salient.sum(dim=1).mean()
+        else:
+            raise ValueError
+ 
+        losses = {'loss_salient': loss_salient}
+
+        return losses
+
+
+
+
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        loss_map = {
+            'labels': self.loss_labels,
+            'boxes': self.loss_boxes,
+            'actionness': self.loss_actionness,
+            'actionness_refine': self.loss_actionness_refine,
+            'boxes_refine': self.loss_boxes_refine
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def forward(self, outputs, targets):
+        """ This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
+
+        if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
+            assert "actionness_logits" in outputs_without_aux
+            # We flatten to compute the cost matrices in a batch
+            logits = outputs_without_aux["actionness_logits"]
+
+            # Also concat the target labels and boxes
+            tgt_ids = torch.cat([v["labels"] for v in targets]) # [gt_instance_num]
+            tgt_bbox = torch.cat([v["segments"] for v in targets]) # [gt_instance_num, 2]
+            sizes = [len(v["segments"]) for v in targets]
+            
+        else:
+            assert "class_logits" in outputs_without_aux
+            # We flatten to compute the cost matrices in a batch
+            logits = outputs_without_aux["class_logits"]
+
+            # Also concat the target labels and boxes
+            tgt_ids = torch.cat([v["semantic_labels"] for v in targets]) # [gt_instance_num]
+            tgt_bbox = torch.cat([v["segments"] for v in targets]) # [gt_instance_num, 2]
+            sizes = [len(v["segments"]) for v in targets]
+
+        indices = self.matcher(logits, outputs_without_aux["pred_boxes"], tgt_ids, tgt_bbox, sizes)
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device).item()
+
+        # Compute all the requested losses
+        losses = {}
+        for loss in self.base_losses:
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+
+        # In case of auxiliary losses, we repeat this process with the output of each innermediate layer.
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets)
+                for loss in self.base_losses:
+                    if loss == 'masks':
+                        # masks loss don't have innermediate feature of decoder, ignore it
+                        continue
+                    kwargs = {}
+                    if loss == 'labels':
+                        # Logging is enabled only for the last layer
+                        kwargs = {'log': False}
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+
+        if self.salient_loss:
+            salient_loss = self.loss_salient(outputs, targets, indices, num_boxes)
+            losses.update(salient_loss)
+
+
+
+        return losses
+
+def build_criterion(args,num_classes,matcher,weight_dict):
+    criterion = SetCriterion(num_classes, 
+                             matcher=matcher, 
+                             weight_dict=weight_dict,
+                             focal_alpha=args.focal_alpha,
+                             args=args)
+    return criterion
