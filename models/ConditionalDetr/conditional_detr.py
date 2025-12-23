@@ -104,26 +104,31 @@ class ConditionalDETR(nn.Module):
         self.salient_loss = args.salient_loss
 
         hidden_dim = transformer.d_model
+        self.inst_dim = hidden_dim // 2
+        self.boundary_dim = hidden_dim // 4
 
-   
+        self.inst_content_embed = nn.Embedding(self.num_queries, self.inst_dim)
+        self.start_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
+        self.end_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
 
-
-
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 2, 3)
+        self.inst_bbox_embed = MLP(self.inst_dim, self.inst_dim, 2, 3)
+        self.start_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
+        self.end_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
         # init bbox_mebed
-        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.inst_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.inst_bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.start_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.start_bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.end_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.end_bbox_embed.layers[-1].bias.data, 0)
         
         if self.enable_refine:
             self.refine_decoder = refine_decoder
 
-        if self.enable_posPrior:
-            self.query_embed = nn.Embedding(self.num_queries,1)
-            self.query_embed.weight.data[:, :1].uniform_(0, 1)
-            self.query_embed.weight.data[:, :1] = inverse_sigmoid(self.query_embed.weight.data[:, :1])
-            self.query_embed.weight.data[:, :1].requires_grad = False
-        else:
-            self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
+        self.query_pos = nn.Embedding(self.num_queries, 2)
+        self.query_pos.weight.data[:, :1].uniform_(0, 1)
+        self.query_pos.weight.data[:, 1:2].fill_(0.2)
+        self.query_pos.weight.data = inverse_sigmoid(self.query_pos.weight.data.clamp(1e-6, 1 - 1e-6))
 
         
         self.input_proj = nn.Conv1d(backbone.feat_dim, hidden_dim, kernel_size=1)
@@ -375,13 +380,25 @@ class ConditionalDETR(nn.Module):
         src, mask = feature_list[-1].decompose()
         assert mask is not None
         src = self.input_proj(src.permute(0,2,1)).permute(0,2,1)
-        
-        memory, hs, reference = self.transformer(src, mask, self.query_embed.weight, pos[-1]) # [enc_layers, b,t,c], [dec_layers,b,num_queries,c], [b,num_queries,1]
+
+        inst_queries = self.inst_content_embed.weight
+        start_queries = self.start_content_embed.weight
+        end_queries = self.end_content_embed.weight
+
+        memory, inst_hs, start_hs, end_hs, reference, enc_dense_logits, enc_dense_boxes = self.transformer(
+            src,
+            mask,
+            (inst_queries, start_queries, end_queries),
+            self.query_pos.weight,
+            pos[-1],
+        )
 
         # record result
         out = {}
         out['memory'] = memory
-        out['hs'] = hs
+        out['hs'] = torch.cat([inst_hs, start_hs, end_hs], dim=-1)
+        out['dense_class_logits'] = enc_dense_logits  # [bs, T, 1]
+        out['dense_pred_boxes'] = enc_dense_boxes  # [bs, T, 2]
 
         # #  For computing ACC use ###
         # # compute the classification accuate of CLIP
@@ -431,30 +448,65 @@ class ConditionalDETR(nn.Module):
             
             salient_logits = self.salient_head(memory[-1].permute(0,2,1)).permute(0,2,1) # [b,t,1]
             out['salient_logits'] = salient_logits
-        
 
+        inst_feat = inst_hs[-1]
+        start_feat = start_hs[-1]
+        end_feat = end_hs[-1]
+        reference_before_sigmoid = inverse_sigmoid(reference)
+
+        inst_delta = self.inst_bbox_embed(inst_feat)
+        cw_logits = inst_delta + reference_before_sigmoid
+        cw_pred = cw_logits.sigmoid()
+
+        start_base = (cw_pred[..., :1] - cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+        end_base = (cw_pred[..., :1] + cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+
+        start_logits = inverse_sigmoid(start_base) + self.start_bbox_embed(start_feat)
+        end_logits = inverse_sigmoid(end_base) + self.end_bbox_embed(end_feat)
+
+        start_pred = start_logits.sigmoid()
+        end_pred = end_logits.sigmoid()
+        width_pred = (end_pred - start_pred).clamp(min=1e-6)
+        center_pred = ((end_pred + start_pred) / 2).clamp(0, 1)
+        pred_boxes = torch.cat([center_pred, width_pred], dim=-1)
+
+        fused_feat_last = torch.cat([inst_feat, start_feat, end_feat], dim=-1)
 
         # refine encoder
         if self.enable_refine:
             with torch.no_grad():
-                reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-                tmp = self.bbox_embed(hs[-1]) # [b,num_queries,2], tmp is the predicted offset value.
-                tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-                outputs_coord = tmp.sigmoid() # [b,num_queries,2]
-                roi_pos = self._roi_align(outputs_coord,pos[-1],mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-                roi_feat = self._roi_align(outputs_coord,clip_feat,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+                roi_pos = self._roi_align(pred_boxes, pos[-1], mask,
+                                          self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
+                roi_feat = self._roi_align(pred_boxes, clip_feat, mask,
+                                           self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
 
             b,q,l,d = roi_feat.shape
-            refine_hs = self.refine_decoder(hs[-1],clip_feat,roi_feat,
+            refine_hs = self.refine_decoder(fused_feat_last, clip_feat, roi_feat,
                                     video_feat_key_padding_mask=mask,
                                     video_pos=pos[-1],
                                     roi_pos=roi_pos)
 
-            refine_hs = hs[-1] + refine_hs
-            reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-            tmp = self.bbox_embed(refine_hs) # [b,num_queries,2], tmp is the predicted offset value.
-            tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-            outputs_coord_refined = tmp.sigmoid() # [b,num_queries,2]
+            refine_hs = fused_feat_last + refine_hs
+            inst_refine, start_refine, end_refine = torch.split(refine_hs,
+                                                                [self.inst_dim, self.boundary_dim, self.boundary_dim],
+                                                                dim=-1)
+
+            inst_delta_refine = self.inst_bbox_embed(inst_refine)
+            cw_logits_refine = inst_delta_refine + reference_before_sigmoid
+            cw_pred_refine = cw_logits_refine.sigmoid()
+
+            start_base_refine = (cw_pred_refine[..., :1] - cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+            end_base_refine = (cw_pred_refine[..., :1] + cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+
+            start_logits_refine = inverse_sigmoid(start_base_refine) + self.start_bbox_embed(start_refine)
+            end_logits_refine = inverse_sigmoid(end_base_refine) + self.end_bbox_embed(end_refine)
+
+            start_pred_refine = start_logits_refine.sigmoid()
+            end_pred_refine = end_logits_refine.sigmoid()
+            width_pred_refine = (end_pred_refine - start_pred_refine).clamp(min=1e-6)
+            center_pred_refine = ((end_pred_refine + start_pred_refine) / 2).clamp(0, 1)
+
+            outputs_coord_refined = torch.cat([center_pred_refine, width_pred_refine], dim=-1)
             out['pred_boxes'] = outputs_coord_refined
 
             if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
@@ -468,34 +520,26 @@ class ConditionalDETR(nn.Module):
                     b,n,dim = class_emb.shape
                     class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
                 else:
-                    class_logits = self.class_embed(hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
+                    class_logits = self.class_embed(refine_hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
                 out['class_logits'] = class_logits
 
 
         else:
-            reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-            outputs_coords = []
-            for lvl in range(hs.shape[0]):
-                tmp = self.bbox_embed(hs[lvl]) # [b,num_queries,2], tmp is the predicted offset value.
-                tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-                outputs_coord = tmp.sigmoid() # [b,num_queries,2]
-                outputs_coords.append(outputs_coord)
-            outputs_coord = torch.stack(outputs_coords) # [dec_layers,b,num_queries,2]
-            out['pred_boxes'] = outputs_coord[-1]
+            out['pred_boxes'] = pred_boxes
 
             if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
                 # compute the class-agnostic foreground score
-                actionness_logits = self.actionness_embed(hs)[-1] # [dec_layers,b,num_queries,1]->[b,num_queries,2]
+                actionness_logits = self.actionness_embed(fused_feat_last)
                 out['actionness_logits'] = actionness_logits
         
 
             if not self.eval_proposal and not self.enable_classAgnostic:
                 if self.target_type != "none":
-                    class_emb = self.class_embed(hs)[-1] # [dec_layers,b,num_queries,dim]->[b,num_queries,dim]
+                    class_emb = self.class_embed(fused_feat_last)
                     b,n,dim = class_emb.shape
                     class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
                 else:
-                    class_logits = self.class_embed(hs)[-1] # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
+                    class_logits = self.class_embed(fused_feat_last)
                 out['class_logits'] = class_logits
 
 
@@ -562,6 +606,9 @@ def build(args, device):
 
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_dense_ce'] = args.cls_loss_coef
+    weight_dict['loss_dense_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_dense_giou'] = args.giou_loss_coef
     
     if args.actionness_loss or args.eval_proposal or args.enable_classAgnostic:
         weight_dict['loss_actionness'] = args.actionness_loss_coef
