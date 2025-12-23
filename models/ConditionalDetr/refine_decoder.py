@@ -422,7 +422,7 @@ class RefineDecoderV2_layer(nn.Module):
             if self.refine_drop_saResidual:
                 if self.refine_cat_type == "concat1":
                     n,b,dim = tgt2.shape
-                    query_feat = tgt2[:,:,0:self.d_model]
+                    query_feat = tgt2[:,:,0:self.d_model] 
                 elif self.refine_cat_type == "concat2":
                     query_feat = self.proj_head(query_feat) # [n,b,2*dim]->[n,b,dim]
                 elif self.refine_cat_type == "sum":
