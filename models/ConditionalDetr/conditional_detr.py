@@ -613,7 +613,7 @@ def build(args, device):
     if args.actionness_loss or args.eval_proposal or args.enable_classAgnostic:
         weight_dict['loss_actionness'] = args.actionness_loss_coef
     if args.salient_loss:
-        weight_dict['loss_salient'] = args.salient_loss_coef
+        weight_dict['loss_salient'] = args.salient_loss_coef 
 
     # TODO this is a hack
     if args.aux_loss:
