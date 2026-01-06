@@ -1,5 +1,3 @@
-
-
 import math
 import copy
 from typing import Optional, List, Tuple
