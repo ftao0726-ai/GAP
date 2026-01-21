@@ -365,7 +365,6 @@ class ConditionalDETR(nn.Module):
         # backbone for temporal modeling
         feature_list, pos = self.backbone(samples) # list of [b,t,c], list of [b,t,c]
 
-        text_feats = None
         # prepare text target
         if self.target_type != "none":
             with torch.no_grad():
@@ -392,7 +391,6 @@ class ConditionalDETR(nn.Module):
             (inst_queries, start_queries, end_queries),
             self.query_pos.weight,
             pos[-1],
-            text_feat=text_feats,
         )
 
         # record result
