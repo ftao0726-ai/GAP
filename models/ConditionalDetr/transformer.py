@@ -1,5 +1,3 @@
-
-
 import math
 import copy
 from typing import Optional, List, Tuple
@@ -115,6 +113,13 @@ class Transformer(nn.Module):
         self.nhead = nhead
         self.dec_layers = num_decoder_layers
         self.enable_posPrior = args.enable_posPrior
+        self.num_queries = args.num_queries
+        self.inst_dim = d_model // 2
+        self.boundary_dim = d_model // 4
+
+        # dense head for query initialization
+        self.enc_dense_cls_head = nn.Linear(d_model, 1)
+        self.enc_dense_bbox_head = MLP(d_model, d_model, 2, 3)
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -136,18 +141,57 @@ class Transformer(nn.Module):
         pos_embed = pos_embed.permute(1, 0, 2) # [t,b,c]
 
         inst_query_embed, start_query_embed, end_query_embed = query_embed_tuple
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # [layers,t,b,c]
+
+        # ===== 使用 Encoder 最后一层输出做密集预测，用于初始化 decoder queries =====
+        last_memory = memory[-1]  # [t,b,c]
+        enc_feat_for_head = last_memory.permute(1, 0, 2)  # [b,t,c]
+
+        enc_dense_logits = self.enc_dense_cls_head(enc_feat_for_head)  # [b,t,1]
+        enc_dense_boxes = self.enc_dense_bbox_head(enc_feat_for_head).sigmoid()  # [b,t,2]
+
+        scores = enc_dense_logits.squeeze(-1)  # [b,t]
+        scores = scores.masked_fill(mask.bool(), float('-inf'))
+
+        K = min(self.num_queries, t)
+        topk_scores, topk_indices = scores.topk(K, dim=1)  # [b,K]
+
+        B, T, C = enc_feat_for_head.shape
+        idx_feat = topk_indices.unsqueeze(-1).expand(-1, -1, C)
+        selected_feats = enc_feat_for_head.gather(1, idx_feat)  # [b,K,c]
+
+        idx_box = topk_indices.unsqueeze(-1).expand(-1, -1, 2)
+        selected_boxes = enc_dense_boxes.gather(1, idx_box)  # [b,K,2]
+
+        if K < self.num_queries:
+            pad_num = self.num_queries - K
+            selected_feats = torch.cat([selected_feats, selected_feats[:, -1:, :].expand(B, pad_num, C)], dim=1)
+            selected_boxes = torch.cat([selected_boxes, selected_boxes[:, -1:, :].expand(B, pad_num, 2)], dim=1)
+            K = self.num_queries
         inst_query_embed = inst_query_embed.unsqueeze(1).repeat(1, bs, 1)
         start_query_embed = start_query_embed.unsqueeze(1).repeat(1, bs, 1)
         end_query_embed = end_query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-        query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1)
+        if self.enable_posPrior:
+            query_pos = selected_boxes.permute(1, 0, 2)  # [num_queries,b,2]
+        else:
+            query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1)
+            if query_pos.shape[0] != selected_boxes.shape[1]:
+                if query_pos.shape[0] < selected_boxes.shape[1]:
+                    pad_num = selected_boxes.shape[1] - query_pos.shape[0]
+                    query_pos = torch.cat([query_pos, query_pos[-1:, :, :].expand(pad_num, bs, -1)], dim=0)
+                else:
+                    query_pos = query_pos[: selected_boxes.shape[1]]
         mask = mask # [b,t]
 
-        inst_tgt = torch.zeros_like(inst_query_embed)
-        start_tgt = torch.zeros_like(start_query_embed)
-        end_tgt = torch.zeros_like(end_query_embed)
+        inst_feats = selected_feats[..., : self.inst_dim]
+        start_feats = selected_feats[..., self.inst_dim: self.inst_dim + self.boundary_dim]
+        end_feats = selected_feats[..., self.inst_dim + self.boundary_dim: self.inst_dim + 2 * self.boundary_dim]
 
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed) # [layers,t,b,c]
+        inst_tgt = inst_feats.permute(1, 0, 2)
+        start_tgt = start_feats.permute(1, 0, 2)
+        end_tgt = end_feats.permute(1, 0, 2)
+
         inst_hs, start_hs, end_hs, references = self.decoder(inst_tgt, start_tgt, end_tgt, memory[-1],
                                                              memory_key_padding_mask=mask,
                                                              pos=pos_embed, query_pos=query_pos,
@@ -155,7 +199,7 @@ class Transformer(nn.Module):
                                                              refine_decoder=refine_decoder)
         # permute TxNxC to NxTxC
         memory = memory.permute(0,2,1,3)
-        return memory, inst_hs, start_hs, end_hs, references
+        return memory, inst_hs, start_hs, end_hs, references, enc_dense_logits, enc_dense_boxes
 
 
 class TransformerEncoder(nn.Module):
