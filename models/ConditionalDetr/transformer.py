@@ -309,8 +309,6 @@ class TransformerDecoder(nn.Module):
                 intermediate_end.append(
                     self.norm_boundary(end_output) if self.norm_boundary is not None else end_output)
 
-
-
         if self.norm_inst is not None:
             inst_output = self.norm_inst(inst_output)
             start_output = self.norm_boundary(start_output)
