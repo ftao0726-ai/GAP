@@ -1,5 +1,3 @@
-
-
 import math
 import copy
 from typing import Optional, List, Tuple
@@ -92,11 +90,18 @@ class Transformer(nn.Module):
                  args = None):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        encoder_layer = ConTransEncoderLayer(d_model, nhead, dim_feedforward,
+                                             dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm, return_intermediate=return_intermediate_enc,args=args)
 
+        self.visual_refine_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.visual_refine_norm = nn.LayerNorm(d_model)
+        self.visual_refine_dropout = nn.Dropout(dropout)
+
+        self.text_refine_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.text_refine_norm = nn.LayerNorm(d_model)
+        self.text_refine_dropout = nn.Dropout(dropout)
 
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(num_decoder_layers, decoder_norm,
@@ -115,6 +120,13 @@ class Transformer(nn.Module):
         self.nhead = nhead
         self.dec_layers = num_decoder_layers
         self.enable_posPrior = args.enable_posPrior
+        self.num_queries = args.num_queries
+        self.inst_dim = d_model // 2
+        self.boundary_dim = d_model // 4
+
+        # dense head for query initialization
+        self.enc_dense_cls_head = nn.Linear(d_model, 1)
+        self.enc_dense_bbox_head = MLP(d_model, d_model, 2, 3)
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -122,7 +134,8 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed_tuple: Tuple[Tensor, Tensor, Tensor], query_pos,
-                pos_embed, clip_feat=None, bbox_function=None, refine_decoder=None):
+                pos_embed, clip_feat=None, bbox_function=None, refine_decoder=None,
+                text_feat: Optional[Tensor] = None):
         '''
         input:
             src: [b,t,c]
@@ -135,19 +148,80 @@ class Transformer(nn.Module):
         src = src.permute(1, 0, 2) # [t,b,c]
         pos_embed = pos_embed.permute(1, 0, 2) # [t,b,c]
 
+        src2 = self.visual_refine_attn(src, src, value=src, attn_mask=None,
+                                       key_padding_mask=mask)[0]
+        src = self.visual_refine_norm(src + self.visual_refine_dropout(src2))
+
+        text_memory = None
+        if text_feat is not None:
+            if text_feat.dim() == 2:
+                text_memory = text_feat.unsqueeze(1).repeat(1, bs, 1)
+            elif text_feat.dim() == 3:
+                if text_feat.shape[1] == 1:
+                    text_memory = text_feat.repeat(1, bs, 1)
+                else:
+                    text_memory = text_feat
+            else:
+                raise ValueError("text_feat must be [n_text, d] or [n_text, b, d].")
+        else:
+            text_memory = src.new_zeros((1, bs, c))
+
+        text2 = self.text_refine_attn(text_memory, text_memory, value=text_memory, attn_mask=None,
+                                      key_padding_mask=None)[0]
+        text_memory = self.text_refine_norm(text_memory + self.text_refine_dropout(text2))
+
         inst_query_embed, start_query_embed, end_query_embed = query_embed_tuple
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed, text=text_memory)  # [layers,t,b,c]
+
+        # ===== 使用 Encoder 最后一层输出做密集预测，用于初始化 decoder queries =====
+        last_memory = memory[-1]  # [t,b,c]
+        enc_feat_for_head = last_memory.permute(1, 0, 2)  # [b,t,c]
+
+        enc_dense_logits = self.enc_dense_cls_head(enc_feat_for_head)  # [b,t,1]
+        enc_dense_boxes = self.enc_dense_bbox_head(enc_feat_for_head).sigmoid()  # [b,t,2]
+
+        scores = enc_dense_logits.squeeze(-1)  # [b,t]
+        scores = scores.masked_fill(mask.bool(), float('-inf'))
+
+        K = min(self.num_queries, t)
+        topk_scores, topk_indices = scores.topk(K, dim=1)  # [b,K]
+
+        B, T, C = enc_feat_for_head.shape
+        idx_feat = topk_indices.unsqueeze(-1).expand(-1, -1, C)
+        selected_feats = enc_feat_for_head.gather(1, idx_feat)  # [b,K,c]
+
+        idx_box = topk_indices.unsqueeze(-1).expand(-1, -1, 2)
+        selected_boxes = enc_dense_boxes.gather(1, idx_box)  # [b,K,2]
+
+        if K < self.num_queries:
+            pad_num = self.num_queries - K
+            selected_feats = torch.cat([selected_feats, selected_feats[:, -1:, :].expand(B, pad_num, C)], dim=1)
+            selected_boxes = torch.cat([selected_boxes, selected_boxes[:, -1:, :].expand(B, pad_num, 2)], dim=1)
+            K = self.num_queries
         inst_query_embed = inst_query_embed.unsqueeze(1).repeat(1, bs, 1)
         start_query_embed = start_query_embed.unsqueeze(1).repeat(1, bs, 1)
         end_query_embed = end_query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-        query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1)
+        if self.enable_posPrior:
+            query_pos = selected_boxes.permute(1, 0, 2)  # [num_queries,b,2]
+        else:
+            query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1)
+            if query_pos.shape[0] != selected_boxes.shape[1]:
+                if query_pos.shape[0] < selected_boxes.shape[1]:
+                    pad_num = selected_boxes.shape[1] - query_pos.shape[0]
+                    query_pos = torch.cat([query_pos, query_pos[-1:, :, :].expand(pad_num, bs, -1)], dim=0)
+                else:
+                    query_pos = query_pos[: selected_boxes.shape[1]]
         mask = mask # [b,t]
 
-        inst_tgt = torch.zeros_like(inst_query_embed)
-        start_tgt = torch.zeros_like(start_query_embed)
-        end_tgt = torch.zeros_like(end_query_embed)
+        inst_feats = selected_feats[..., : self.inst_dim]
+        start_feats = selected_feats[..., self.inst_dim: self.inst_dim + self.boundary_dim]
+        end_feats = selected_feats[..., self.inst_dim + self.boundary_dim: self.inst_dim + 2 * self.boundary_dim]
 
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed) # [layers,t,b,c]
+        inst_tgt = inst_feats.permute(1, 0, 2)
+        start_tgt = start_feats.permute(1, 0, 2)
+        end_tgt = end_feats.permute(1, 0, 2)
+
         inst_hs, start_hs, end_hs, references = self.decoder(inst_tgt, start_tgt, end_tgt, memory[-1],
                                                              memory_key_padding_mask=mask,
                                                              pos=pos_embed, query_pos=query_pos,
@@ -155,7 +229,7 @@ class Transformer(nn.Module):
                                                              refine_decoder=refine_decoder)
         # permute TxNxC to NxTxC
         memory = memory.permute(0,2,1,3)
-        return memory, inst_hs, start_hs, end_hs, references
+        return memory, inst_hs, start_hs, end_hs, references, enc_dense_logits, enc_dense_boxes
 
 
 class TransformerEncoder(nn.Module):
@@ -163,33 +237,55 @@ class TransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers, norm=None, return_intermediate=False, args=None):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
+        self.downsamples = nn.ModuleList(
+            [StridedDepthwiseDownsample(encoder_layer.d_model) for _ in range(num_layers - 1)]
+        )
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
+        self.fuse_proj = nn.Linear(encoder_layer.d_model * num_layers, encoder_layer.d_model)
 
     def forward(self, src,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+                pos: Optional[Tensor] = None,
+                text: Optional[Tensor] = None):
         output = src
 
-        intermediate = []
-        for layer in self.layers:
-            output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
-            if self.return_intermediate:
-                intermediate.append(output)
+        current_pos = pos
+        current_key_padding_mask = src_key_padding_mask
+        base_length = output.shape[0]
+        multi_level_outputs = []
+        if current_key_padding_mask is not None:
+            current_pos = position_encoding_from_mask(current_key_padding_mask, output.shape[2])
+
+        for layer_id, layer in enumerate(self.layers):
+            output = layer(output, src_mask=mask,src_key_padding_mask=current_key_padding_mask, pos=current_pos, text=text)
+            multi_level_outputs.append(output)
+
+            if layer_id < self.num_layers - 1:
+                output = self.downsamples[layer_id](output)
+                if current_key_padding_mask is not None:
+                    current_key_padding_mask = downsample_mask(current_key_padding_mask)
+                if current_key_padding_mask is not None:
+                    current_pos = position_encoding_from_mask(current_key_padding_mask, output.shape[2])
+                elif current_pos is not None:
+                    current_pos = current_pos[::2]
 
         if self.norm is not None:
             output = self.norm(output)
-            if self.return_intermediate:
-                intermediate.pop()
-                intermediate.append(output)
+            multi_level_outputs[-1] = output
+
+        upsampled_outputs = [
+            upsample_to_length(layer_output, base_length) for layer_output in multi_level_outputs
+        ]
+        fused = self.fuse_proj(torch.cat(upsampled_outputs, dim=-1))
+        upsampled_outputs[-1] = fused
         
         if self.return_intermediate:
-            return torch.stack(intermediate,dim=0) # [layers,t,b,c]
+            return torch.stack(upsampled_outputs, dim=0) # [layers,t,b,c]
 
-        return output
+        return fused
 
 
 class TransformerDecoder(nn.Module):
@@ -389,6 +485,141 @@ class TransformerEncoderLayer(nn.Module):
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
+class ConTransConvBlock(nn.Module):
+
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.pointwise_glu = nn.Conv1d(d_model, d_model * 2, kernel_size=1)
+        self.depthwise = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.batch_norm = nn.BatchNorm1d(d_model)
+        self.pointwise = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        x = x.permute(1, 2, 0)
+        x = F.glu(self.pointwise_glu(x), dim=1)
+        x = self.depthwise(x)
+        x = self.batch_norm(x)
+        x = F.silu(x)
+        x = self.pointwise(x)
+        x = self.dropout(x)
+        x = x.permute(2, 0, 1)
+        return x
+
+
+class ConTransEncoderLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.d_model = d_model
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.conv_block = ConTransConvBlock(d_model, dropout=dropout)
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self,
+                     src,
+                     text: Optional[Tensor] = None,
+                     src_mask: Optional[Tensor] = None,
+                     src_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None):
+        if text is None:
+            raise ValueError("text memory is required for ConTransEncoderLayer.")
+
+        q = text
+        k = self.with_pos_embed(src, pos)
+        _, attn_weights = self.cross_attn(q, k, value=src, attn_mask=src_mask,
+                                          key_padding_mask=src_key_padding_mask, need_weights=True)
+        text_b = text.transpose(0, 1)
+        attn_weights = attn_weights.transpose(1, 2)
+        sem = torch.bmm(attn_weights, text_b).transpose(0, 1)
+
+        src = src + self.dropout1(sem)
+        src = self.norm1(src)
+
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+
+        src2 = self.conv_block(src)
+        src = src + self.dropout3(src2)
+        src = self.norm3(src)
+        return src
+
+    def forward_pre(self, src,
+                    text: Optional[Tensor] = None,
+                    src_mask: Optional[Tensor] = None,
+                    src_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None):
+        return self.forward_post(src, text, src_mask, src_key_padding_mask, pos)
+
+    def forward(self, src,
+                text: Optional[Tensor] = None,
+                src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None):
+        if self.normalize_before:
+            return self.forward_pre(src, text, src_mask, src_key_padding_mask, pos)
+        return self.forward_post(src, text, src_mask, src_key_padding_mask, pos)
+
+
+class StridedDepthwiseDownsample(nn.Module):
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1, groups=d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.permute(1, 2, 0)
+        x = self.conv(x)
+        x = x.permute(2, 0, 1)
+        return x
+
+
+def downsample_mask(mask: Tensor) -> Tensor:
+    mask = mask.float().unsqueeze(1)
+    mask = F.avg_pool1d(mask, kernel_size=3, stride=2, padding=1)
+    return mask.squeeze(1).ge(0.5)
+
+
+def upsample_to_length(x: Tensor, length: int) -> Tensor:
+    if x.shape[0] == length:
+        return x
+    x = x.permute(1, 2, 0)
+    x = F.interpolate(x, size=length, mode="linear", align_corners=False)
+    return x.permute(2, 0, 1)
+
+
+def position_encoding_from_mask(mask: Tensor, num_pos_feats: int,
+                                temperature: int = 10000, normalize: bool = True) -> Tensor:
+    not_mask = ~mask
+    x_embed = not_mask.cumsum(1, dtype=torch.float32)
+    if normalize:
+        eps = 1e-6
+        x_embed = x_embed / (x_embed[:, -1:] + eps) * (2 * math.pi)
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=mask.device)
+    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode='trunc') / num_pos_feats)
+    pos_x = x_embed[:, :, None] / dim_t
+    pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+    return pos_x.permute(1, 0, 2)
 
 class InstanceDecoderLayer(nn.Module):
 
