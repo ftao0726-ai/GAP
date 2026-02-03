@@ -1,3 +1,15 @@
+# ------------------------------------------------------------------------
+# Conditional DETR model and criterion classes.
+# Copyright (c) 2021 Microsoft. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+# Modified from DETR (https://github.com/facebookresearch/detr)
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
+# Copyright (c) 2020 SenseTime. All Rights Reserved.
+# ------------------------------------------------------------------------
+
 import math
 import torch
 import torch.nn.functional as F
@@ -353,6 +365,7 @@ class ConditionalDETR(nn.Module):
         # backbone for temporal modeling
         feature_list, pos = self.backbone(samples) # list of [b,t,c], list of [b,t,c]
 
+        text_feats = None
         # prepare text target
         if self.target_type != "none":
             with torch.no_grad():
@@ -373,14 +386,21 @@ class ConditionalDETR(nn.Module):
         start_queries = self.start_content_embed.weight
         end_queries = self.end_content_embed.weight
 
-        memory, inst_hs, start_hs, end_hs, reference = self.transformer(src, mask,
-                                                                        (inst_queries, start_queries, end_queries),
-                                                                        self.query_pos.weight, pos[-1])
+        memory, inst_hs, start_hs, end_hs, reference, enc_dense_logits, enc_dense_boxes = self.transformer(
+            src,
+            mask,
+            (inst_queries, start_queries, end_queries),
+            self.query_pos.weight,
+            pos[-1],
+            text_feat=text_feats,
+        )
 
         # record result
         out = {}
         out['memory'] = memory
         out['hs'] = torch.cat([inst_hs, start_hs, end_hs], dim=-1)
+        out['dense_class_logits'] = enc_dense_logits  # [bs, T, 1]
+        out['dense_pred_boxes'] = enc_dense_boxes  # [bs, T, 2]
 
         # #  For computing ACC use ###
         # # compute the classification accuate of CLIP
@@ -588,6 +608,9 @@ def build(args, device):
 
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_dense_ce'] = args.cls_loss_coef
+    weight_dict['loss_dense_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_dense_giou'] = args.giou_loss_coef
     
     if args.actionness_loss or args.eval_proposal or args.enable_classAgnostic:
         weight_dict['loss_actionness'] = args.actionness_loss_coef
