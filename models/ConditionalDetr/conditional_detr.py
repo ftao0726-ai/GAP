@@ -644,3 +644,4 @@ def build(args, device):
     postprocessor = build_postprocess(args)
 
     return model, criterion, postprocessor
+
