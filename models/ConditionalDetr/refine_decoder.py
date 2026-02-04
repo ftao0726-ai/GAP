@@ -75,6 +75,7 @@ class RefineDecoder(nn.Module):
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
+                roi_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 roi_pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
@@ -100,6 +101,11 @@ class RefineDecoder(nn.Module):
 
         intermediate = []
         reference_points = query_pos.sigmoid().transpose(0,1) # [batch_size, num_queries, 1]
+        if roi_key_padding_mask is not None:
+            roi_key_padding_mask = roi_key_padding_mask.permute(1, 0, 2)
+            roi_key_padding_mask = roi_key_padding_mask.reshape(
+                roi_key_padding_mask.shape[0] * roi_key_padding_mask.shape[1],
+                roi_key_padding_mask.shape[2])
 
         # reference_points_before_sigmoid = self.ref_point_head(query_pos)    # [num_queries, batch_size, 1]->[num_queries, batch_size,dim]
         # reference_points = reference_points_before_sigmoid.sigmoid().transpose(0, 1) # [batch_size, num_queries, 1]
@@ -124,6 +130,7 @@ class RefineDecoder(nn.Module):
                         memory_mask=memory_mask,
                         tgt_key_padding_mask=tgt_key_padding_mask,
                         memory_key_padding_mask=memory_key_padding_mask,
+                        roi_key_padding_mask=roi_key_padding_mask,
                         pos=pos, roi_pos=roi_pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
                         is_first=(layer_id == 0)
                         )
@@ -211,6 +218,7 @@ class RefineDecoderLayer(nn.Module):
                      memory_mask: Optional[Tensor] = None,
                      tgt_key_padding_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
+                     roi_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      roi_pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
@@ -257,7 +265,8 @@ class RefineDecoderLayer(nn.Module):
         v_l = v_l.view(num_queries*bs,l,n_model).permute(1,0,2)# [l,n*b,dim*2]
         tgt_l = self.cross_attn_l(query=q_l,
                                   key=k_l,
-                                  value=v_l)[0]
+                                  value=v_l,
+                                  key_padding_mask=roi_key_padding_mask)[0]
         tgt_l = tgt_l.reshape(num_queries,bs,n_model)
         
         tgt_l = tgt + self.dropout2_l(tgt_l)
@@ -343,11 +352,18 @@ class RefineDecoderV2(nn.Module):
     def forward(self, query_feat, video_feat, roi_segment_feat,
                 video_feat_key_padding_mask: Optional[Tensor] = None,
                 video_pos: Optional[Tensor] = None,
-                roi_pos: Optional[Tensor] = None):
+                roi_pos: Optional[Tensor] = None,
+                roi_key_padding_mask: Optional[Tensor] = None):
         
         output = query_feat
+        if roi_key_padding_mask is not None:
+            roi_key_padding_mask = roi_key_padding_mask.permute(1, 0, 2)
+            roi_key_padding_mask = roi_key_padding_mask.reshape(
+                roi_key_padding_mask.shape[0] * roi_key_padding_mask.shape[1],
+                roi_key_padding_mask.shape[2])
         for layer in self.layers:
-            output = layer(query_feat, video_feat, roi_segment_feat, video_feat_key_padding_mask, video_pos, roi_pos)
+            output = layer(query_feat, video_feat, roi_segment_feat, video_feat_key_padding_mask, video_pos, roi_pos,
+                           roi_key_padding_mask)
         
         return output
 
@@ -371,7 +387,8 @@ class RefineDecoderV2_layer(nn.Module):
     def forward(self, query_feat, video_feat, roi_segment_feat,
                 video_feat_key_padding_mask: Optional[Tensor] = None,
                 video_pos: Optional[Tensor] = None,
-                roi_pos: Optional[Tensor] = None):
+                roi_pos: Optional[Tensor] = None,
+                roi_key_padding_mask: Optional[Tensor] = None):
         '''
             query_feat: [b,n,c]
             roi_segment_feat: [b,n,l,c]
@@ -390,7 +407,10 @@ class RefineDecoderV2_layer(nn.Module):
 
             tgt1 = self.cross_attn_local(query=query_feat_seg,
                                         key=segment_feat,
-                                        value=segment_feat)[0] # [1,n*b,dim]
+                                         value=segment_feat,
+                                         key_padding_mask=roi_key_padding_mask)[0]  # [1,n*b,dim]
+
+
             tgt1 = tgt1.reshape(n,b,dim)
         elif self.refine_fusion_type == "mean":
             query_feat = query_feat.permute(1,0,2) # [num_queries,b,dim]
@@ -422,7 +442,7 @@ class RefineDecoderV2_layer(nn.Module):
             if self.refine_drop_saResidual:
                 if self.refine_cat_type == "concat1":
                     n,b,dim = tgt2.shape
-                    query_feat = tgt2[:,:,0:self.d_model] 
+                    query_feat = tgt2[:,:,0:self.d_model]
                 elif self.refine_cat_type == "concat2":
                     query_feat = self.proj_head(query_feat) # [n,b,2*dim]->[n,b,dim]
                 elif self.refine_cat_type == "sum":
