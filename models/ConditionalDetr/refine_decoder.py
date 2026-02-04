@@ -434,7 +434,7 @@ class RefineDecoderV2_layer(nn.Module):
                 query_feat = query_feat + tgt1
             else:
                 raise ValueError
-
+ 
             # self-attetnion between different query
             tgt2 = self.self_attn(query=query_feat,
                                 key=query_feat,
