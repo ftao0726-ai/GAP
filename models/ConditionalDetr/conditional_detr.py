@@ -234,6 +234,44 @@ class ConditionalDETR(nn.Module):
         roi_feat = roi_feat.permute(0, 1, 3, 2)  # [B,Q,output_width,dim]
         return roi_feat
 
+    def _roi_grid_sample(self, rois, origin_feat, mask, max_roi_size, scale_factor=1):
+        B, Q, _ = rois.shape
+        B, T, C = origin_feat.shape
+        truely_length = T - torch.sum(mask, dim=1)  # [B]
+        truely_length = truely_length.clamp(min=1)
+        rois_center = rois[:, :, 0:1]
+        rois_size = rois[:, :, 1:2] * scale_factor
+        rois_abs = torch.cat(
+            (rois_center - rois_size / 2, rois_center + rois_size / 2), dim=2) * truely_length.reshape(-1, 1, 1)
+        max_len = (truely_length - 1).clamp(min=1).reshape(-1, 1, 1)
+        rois_abs = torch.clamp(rois_abs, min=torch.zeros_like(rois_abs), max=max_len)
+        start = rois_abs[:, :, 0:1]
+        end = rois_abs[:, :, 1:2]
+
+        roi_length = (end - start).clamp(min=1)
+        roi_len = roi_length.round().long().squeeze(-1).clamp(min=1, max=max_roi_size)  # [B,Q]
+        L_max = int(roi_len.max().item())
+        idx = torch.arange(L_max, device=origin_feat.device).view(1, 1, L_max)
+        roi_len_minus = (roi_len - 1).clamp(min=1).unsqueeze(-1)
+        max_idx = (roi_len - 1).clamp(min=0).unsqueeze(-1)
+        idx_clip = torch.minimum(idx, max_idx)
+        pos_frac = idx_clip / roi_len_minus
+        pos_abs = start + (end - start) * pos_frac
+        pos_norm = (pos_abs / max_len) * 2 - 1
+        pos_norm = pos_norm.clamp(-1, 1)
+
+        y = torch.zeros_like(pos_norm)
+        grid = torch.stack((pos_norm, y), dim=-1)  # [B,Q,L,2]
+
+        feat = origin_feat.permute(0, 2, 1).reshape(B, C, 1, T)
+        feat = feat.unsqueeze(1).expand(-1, Q, -1, -1, -1).reshape(B * Q, C, 1, T)
+        grid = grid.view(B * Q, 1, L_max, 2)
+        roi_feat = F.grid_sample(feat, grid, mode="bilinear", align_corners=True)
+        roi_feat = roi_feat.reshape(B, Q, C, 1, L_max).squeeze(3).permute(0, 1, 3, 2)
+
+        roi_mask = idx >= roi_len.unsqueeze(-1)
+        return roi_feat, roi_mask
+
     # @torch.no_grad()
     def _compute_similarity(self, visual_feats, text_feats):
         '''
@@ -458,16 +496,17 @@ class ConditionalDETR(nn.Module):
         # refine encoder
         if self.enable_refine:
             with torch.no_grad():
-                roi_pos = self._roi_align(pred_boxes, pos[-1], mask,
-                                          self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
-                roi_feat = self._roi_align(pred_boxes, clip_feat, mask,
-                                           self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
+                roi_pos, roi_mask = self._roi_grid_sample(pred_boxes, pos[-1], mask,
+                                                          self.ROIalign_size)
+                roi_feat, _ = self._roi_grid_sample(pred_boxes, clip_feat, mask,
+                                                    self.ROIalign_size)
 
             b, q, l, d = roi_feat.shape
             refine_hs = self.refine_decoder(fused_feat_last, clip_feat, roi_feat,
                                             video_feat_key_padding_mask=mask,
                                             video_pos=pos[-1],
-                                            roi_pos=roi_pos)
+                                            roi_pos=roi_pos,
+                                            roi_key_padding_mask=roi_mask)
 
             refine_hs = fused_feat_last + refine_hs
             inst_refine, start_refine, end_refine = torch.split(refine_hs,
