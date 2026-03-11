@@ -50,13 +50,14 @@ class MLP(nn.Module):
 
 class ConditionalDETR(nn.Module):
     """ This is the Conditional DETR module that performs object detection """
-    def __init__(self, 
-                 backbone, 
-                 transformer, 
-                 text_encoder, 
+
+    def __init__(self,
+                 backbone,
+                 transformer,
+                 text_encoder,
                  refine_decoder,
-                 logit_scale, 
-                 device, 
+                 logit_scale,
+                 device,
                  num_classes,
                  args):
         """ Initializes the model.
@@ -86,17 +87,16 @@ class ConditionalDETR(nn.Module):
         self.aux_loss = args.aux_loss
         self.norm_embed = args.norm_embed
         self.exp_logit_scale = args.exp_logit_scale
-       
+
         self.ROIalign_strategy = args.ROIalign_strategy
         self.ROIalign_size = args.ROIalign_size
-        
+
         self.pooling_type = args.pooling_type
 
-        self.eval_proposal = args.eval_proposal 
+        self.eval_proposal = args.eval_proposal
 
         self.actionness_loss = args.actionness_loss
         self.enable_classAgnostic = args.enable_classAgnostic
-
 
         self.enable_refine = args.enable_refine
         self.enable_posPrior = args.enable_posPrior
@@ -104,30 +104,34 @@ class ConditionalDETR(nn.Module):
         self.salient_loss = args.salient_loss
 
         hidden_dim = transformer.d_model
+        self.inst_dim = hidden_dim // 2
+        self.boundary_dim = hidden_dim // 4
 
-   
+        self.inst_content_embed = nn.Embedding(self.num_queries, self.inst_dim)
+        self.start_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
+        self.end_content_embed = nn.Embedding(self.num_queries, self.boundary_dim)
 
-
-
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 2, 3)
+        self.inst_bbox_embed = MLP(self.inst_dim, self.inst_dim, 2, 3)
+        self.start_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
+        self.end_bbox_embed = MLP(self.boundary_dim, self.boundary_dim, 1, 3)
         # init bbox_mebed
-        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
-        
+        nn.init.constant_(self.inst_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.inst_bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.start_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.start_bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.end_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(self.end_bbox_embed.layers[-1].bias.data, 0)
+
         if self.enable_refine:
             self.refine_decoder = refine_decoder
 
-        if self.enable_posPrior:
-            self.query_embed = nn.Embedding(self.num_queries,1)
-            self.query_embed.weight.data[:, :1].uniform_(0, 1)
-            self.query_embed.weight.data[:, :1] = inverse_sigmoid(self.query_embed.weight.data[:, :1])
-            self.query_embed.weight.data[:, :1].requires_grad = False
-        else:
-            self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
+        self.query_pos = nn.Embedding(self.num_queries, 2)
+        self.query_pos.weight.data[:, :1].uniform_(0, 1)
+        self.query_pos.weight.data[:, 1:2].fill_(0.2)
+        self.query_pos.weight.data = inverse_sigmoid(self.query_pos.weight.data.clamp(1e-6, 1 - 1e-6))
 
-        
         self.input_proj = nn.Conv1d(backbone.feat_dim, hidden_dim, kernel_size=1)
-        
+
         if self.target_type != "none":
             self.class_embed = nn.Linear(hidden_dim, hidden_dim)
             # init prior_prob setting for focal loss
@@ -144,12 +148,11 @@ class ConditionalDETR(nn.Module):
                 self.class_embed.bias.data = torch.ones(num_classes) * bias_value
 
         if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
-            self.actionness_embed = nn.Linear(hidden_dim,1)
+            self.actionness_embed = nn.Linear(hidden_dim, 1)
             # init prior_prob setting for focal loss
             prior_prob = 0.01
             bias_value = -math.log((1 - prior_prob) / prior_prob)
             self.actionness_embed.bias.data = torch.ones(1) * bias_value
-
 
         if self.salient_loss:
             self.salient_head = nn.Sequential(
@@ -167,25 +170,26 @@ class ConditionalDETR(nn.Module):
         def get_prompt(cl_names):
             temp_prompt = []
             for c in cl_names:
-                temp_prompt.append("a video of a person doing"+" "+c)
+                temp_prompt.append("a video of a person doing" + " " + c)
             return temp_prompt
-        
+
         def get_description(cl_names):
             temp_prompt = []
             for c in cl_names:
-                temp_prompt.append(description_dict[c]['Elaboration']['Description'][0]) # NOTE: default the idx of description is 0.
+                temp_prompt.append(
+                    description_dict[c]['Elaboration']['Description'][0])  # NOTE: default the idx of description is 0.
             return temp_prompt
-        
+
         if target_type == 'prompt':
             act_prompt = get_prompt(cl_names)
         elif target_type == 'description':
             act_prompt = get_description(cl_names)
         elif target_type == 'name':
             act_prompt = cl_names
-        else: 
+        else:
             raise ValueError("Don't define this text_mode.")
-        
-        tokens = clip_pkg.tokenize(act_prompt).long().to(device) # input_ids->input_ids:[150,length]
+
+        tokens = clip_pkg.tokenize(act_prompt).long().to(device)  # input_ids->input_ids:[150,length]
         text_feats = self.text_encoder(tokens).float()
 
         return text_feats
@@ -198,36 +202,36 @@ class ConditionalDETR(nn.Module):
         '''
         # transform to absolute axis
         B, N = rois.shape[:2]
-        rois_center = rois[:, :, 0:1] # [B,N,1]
-        rois_size = rois[:, :, 1:2] * scale_factor # [B,N,1]
-        truely_length = truely_length.reshape(-1,1,1) # [B,1,1]
+        rois_center = rois[:, :, 0:1]  # [B,N,1]
+        rois_size = rois[:, :, 1:2] * scale_factor  # [B,N,1]
+        truely_length = truely_length.reshape(-1, 1, 1)  # [B,1,1]
         rois_abs = torch.cat(
-            (rois_center - rois_size/2, rois_center + rois_size/2), dim=2) * truely_length # [B,N,2]->"start,end"
+            (rois_center - rois_size / 2, rois_center + rois_size / 2), dim=2) * truely_length  # [B,N,2]->"start,end"
         # expand the RoIs
-        _max = truely_length.repeat(1,N,2)
+        _max = truely_length.repeat(1, N, 2)
         _min = torch.zeros_like(_max)
         rois_abs = torch.clamp(rois_abs, min=_min, max=_max)  # (B, N, 2)
         # transfer to 4 dimension coordination
-        rois_abs_4d = torch.zeros((B,N,4),dtype=rois_abs.dtype,device=rois_abs.device)
-        rois_abs_4d[:,:,0], rois_abs_4d[:,:,2] = rois_abs[:,:,0], rois_abs[:,:,1] # x1,0,x2,0
+        rois_abs_4d = torch.zeros((B, N, 4), dtype=rois_abs.dtype, device=rois_abs.device)
+        rois_abs_4d[:, :, 0], rois_abs_4d[:, :, 2] = rois_abs[:, :, 0], rois_abs[:, :, 1]  # x1,0,x2,0
 
         # add batch index
-        batch_ind = torch.arange(0, B).view((B, 1, 1)).to(rois_abs.device) # [B,1,1]
-        batch_ind = batch_ind.repeat(1, N, 1) # [B,N,1]
-        rois_abs_4d = torch.cat((batch_ind, rois_abs_4d), dim=2) # [B,N,1+4]->"batch_id,x1,0,x2,0"
+        batch_ind = torch.arange(0, B).view((B, 1, 1)).to(rois_abs.device)  # [B,1,1]
+        batch_ind = batch_ind.repeat(1, N, 1)  # [B,N,1]
+        rois_abs_4d = torch.cat((batch_ind, rois_abs_4d), dim=2)  # [B,N,1+4]->"batch_id,x1,0,x2,0"
         # NOTE: stop gradient here to stablize training
-        return rois_abs_4d.view((B*N, 5)).detach()
+        return rois_abs_4d.view((B * N, 5)).detach()
 
     def _roi_align(self, rois, origin_feat, mask, ROIalign_size, scale_factor=1):
-        B,Q,_ = rois.shape
-        B,T,C = origin_feat.shape
-        truely_length = T-torch.sum(mask,dim=1) # [B]
-        rois_abs_4d = self._to_roi_align_format(rois,truely_length,scale_factor)
-        feat = origin_feat.permute(0,2,1) # [B,dim,T]
-        feat = feat.reshape(B,C,1,T)
-        roi_feat = ROIalign(feat, rois_abs_4d, output_size=(1,ROIalign_size))
-        roi_feat = roi_feat.reshape(B,Q,C,-1) # [B,Q,dim,output_width]
-        roi_feat = roi_feat.permute(0,1,3,2) # [B,Q,output_width,dim]
+        B, Q, _ = rois.shape
+        B, T, C = origin_feat.shape
+        truely_length = T - torch.sum(mask, dim=1)  # [B]
+        rois_abs_4d = self._to_roi_align_format(rois, truely_length, scale_factor)
+        feat = origin_feat.permute(0, 2, 1)  # [B,dim,T]
+        feat = feat.reshape(B, C, 1, T)
+        roi_feat = ROIalign(feat, rois_abs_4d, output_size=(1, ROIalign_size))
+        roi_feat = roi_feat.reshape(B, Q, C, -1)  # [B,Q,dim,output_width]
+        roi_feat = roi_feat.permute(0, 1, 3, 2)  # [B,Q,output_width,dim]
         return roi_feat
 
     # @torch.no_grad()
@@ -235,102 +239,107 @@ class ConditionalDETR(nn.Module):
         '''
         text_feats: [num_classes,dim]
         '''
-        if len(visual_feats.shape)==2: # batch_num_instance,dim
+        if len(visual_feats.shape) == 2:  # batch_num_instance,dim
             if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
+                visual_feats = visual_feats / visual_feats.norm(dim=-1, keepdim=True)
+                text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
                 if self.exp_logit_scale:
                     logit_scale = self.logit_scale.exp()
                 else:
                     logit_scale = self.logit_scale
-                logits = torch.einsum("bd,cd->bc",visual_feats,text_feats)*logit_scale
+                logits = torch.einsum("bd,cd->bc", visual_feats, text_feats) * logit_scale
             else:
-                logits = torch.einsum("bd,cd->bc",visual_feats,text_feats)
+                logits = torch.einsum("bd,cd->bc", visual_feats, text_feats)
             return logits
-        elif len(visual_feats.shape)==3:# batch,num_queries/snippet_length,dim
+        elif len(visual_feats.shape) == 3:  # batch,num_queries/snippet_length,dim
             if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
+                visual_feats = visual_feats / visual_feats.norm(dim=-1, keepdim=True)
+                text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
                 if self.exp_logit_scale:
                     logit_scale = self.logit_scale.exp()
                 else:
                     logit_scale = self.logit_scale
-                logits = torch.einsum("bqd,cd->bqc",visual_feats,text_feats)*logit_scale
+                logits = torch.einsum("bqd,cd->bqc", visual_feats, text_feats) * logit_scale
             else:
-                logits = torch.einsum("bqd,cd->bqc",visual_feats,text_feats)
+                logits = torch.einsum("bqd,cd->bqc", visual_feats, text_feats)
             return logits
-        elif len(visual_feats.shape)==4:# batch,num_queries,snippet_length,dim
+        elif len(visual_feats.shape) == 4:  # batch,num_queries,snippet_length,dim
             if self.norm_embed:
-                visual_feats = visual_feats / visual_feats.norm(dim=-1,keepdim=True)
-                text_feats = text_feats / text_feats.norm(dim=-1,keepdim=True)
+                visual_feats = visual_feats / visual_feats.norm(dim=-1, keepdim=True)
+                text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
                 if self.exp_logit_scale:
                     logit_scale = self.logit_scale.exp()
                 else:
                     logit_scale = self.logit_scale
-                logits = torch.einsum("bqld,cd->bqlc",visual_feats,text_feats)*logit_scale
+                logits = torch.einsum("bqld,cd->bqlc", visual_feats, text_feats) * logit_scale
             else:
-                logits = torch.einsum("bqld,cd->bqlc",visual_feats,text_feats)
+                logits = torch.einsum("bqld,cd->bqlc", visual_feats, text_feats)
             return logits
-        
+
         else:
             raise NotImplementedError
 
-     
-    def _temporal_pooling(self,pooling_type,coordinate,clip_feat,mask,ROIalign_size,text_feats):
-        b,t,_ = coordinate.shape
+    def _temporal_pooling(self, pooling_type, coordinate, clip_feat, mask, ROIalign_size, text_feats):
+        b, t, _ = coordinate.shape
         if pooling_type == "average":
-            roi_feat = self._roi_align(rois=coordinate,origin_feat=clip_feat+1e-4,mask=mask,ROIalign_size=ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+            roi_feat = self._roi_align(rois=coordinate, origin_feat=clip_feat + 1e-4, mask=mask,
+                                       ROIalign_size=ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
             # roi_feat = roi_feat.mean(-2) # [B,Q,dim]
             if self.ROIalign_strategy == "before_pred":
-                roi_feat = roi_feat.mean(-2) # [B,Q,dim]
-                ROIalign_logits = self._compute_similarity(roi_feat,text_feats) # [b,Q,num_classes]
+                roi_feat = roi_feat.mean(-2)  # [B,Q,dim]
+                ROIalign_logits = self._compute_similarity(roi_feat, text_feats)  # [b,Q,num_classes]
             elif self.ROIalign_strategy == "after_pred":
-                roi_feat = roi_feat # [B,Q,L,dim]
-                ROIalign_logits = self._compute_similarity(roi_feat,text_feats) # [b,Q,L,num_classes]
-                ROIalign_logits = ROIalign_logits.mean(-2) # [B,Q,num_classes]
+                roi_feat = roi_feat  # [B,Q,L,dim]
+                ROIalign_logits = self._compute_similarity(roi_feat, text_feats)  # [b,Q,L,num_classes]
+                ROIalign_logits = ROIalign_logits.mean(-2)  # [B,Q,num_classes]
             else:
                 raise NotImplementedError
         elif pooling_type == "max":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            roi_feat = roi_feat.max(dim=2)[0] # [bs,num_queries,dim]
+            roi_feat = self._roi_align(coordinate, clip_feat + 1e-4, mask,
+                                       self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
+            roi_feat = roi_feat.max(dim=2)[0]  # [bs,num_queries,dim]
 
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
+            ROIalign_logits = self._compute_similarity(roi_feat, text_feats)
         elif pooling_type == "center1":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+            roi_feat = self._roi_align(coordinate, clip_feat + 1e-4, mask,
+                                       self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
             center_idx = int(roi_feat.shape[2] / 2)
-            roi_feat = roi_feat[:,:,center_idx,:] 
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
+            roi_feat = roi_feat[:, :, center_idx, :]
+            ROIalign_logits = self._compute_similarity(roi_feat, text_feats)
         elif pooling_type == "center2":
-            rois = coordinate # [b,n,2]
-            rois_center = rois[:, :, 0:1] # [B,N,1]
+            rois = coordinate  # [b,n,2]
+            rois_center = rois[:, :, 0:1]  # [B,N,1]
             # rois_size = rois[:, :, 1:2] * scale_factor # [B,N,1]
-            truely_length = t-torch.sum(mask,dim=1) # [B]
-            truely_length = truely_length.reshape(-1,1,1) # [B,1,1]
-            center_idx = (rois_center*truely_length).long() # [b,n,1]
+            truely_length = t - torch.sum(mask, dim=1)  # [B]
+            truely_length = truely_length.reshape(-1, 1, 1)  # [B,1,1]
+            center_idx = (rois_center * truely_length).long()  # [b,n,1]
             roi_feat = torch.gather(clip_feat + 1e-4, dim=1, index=center_idx.expand(-1, -1, clip_feat.shape[-1]))
-            ROIalign_logits = self._compute_similarity(roi_feat,text_feats)
+            ROIalign_logits = self._compute_similarity(roi_feat, text_feats)
         elif pooling_type == "self_attention":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+            roi_feat = self._roi_align(coordinate, clip_feat + 1e-4, mask,
+                                       self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
             attention_weights = F.softmax(torch.matmul(roi_feat, roi_feat.transpose(-2, -1)), dim=-1)
             roi_feat_sa = torch.matmul(attention_weights, roi_feat)
             roi_feat_sa = roi_feat_sa.mean(2)
-            ROIalign_logits = self._compute_similarity(roi_feat_sa,text_feats)
+            ROIalign_logits = self._compute_similarity(roi_feat_sa, text_feats)
         elif pooling_type == "slow_fast":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-            fast_feat = roi_feat.mean(dim=2) # [b,q,d]
+            roi_feat = self._roi_align(coordinate, clip_feat + 1e-4, mask,
+                                       self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
+            fast_feat = roi_feat.mean(dim=2)  # [b,q,d]
             step = int(self.ROIalign_size // 4)
-            slow_feat = roi_feat[:,:,::step,:].mean(dim=2) # [b,q,d]
-            roi_feat_final = (fast_feat + slow_feat)/2
-            ROIalign_logits = self._compute_similarity(roi_feat_final,text_feats)
+            slow_feat = roi_feat[:, :, ::step, :].mean(dim=2)  # [b,q,d]
+            roi_feat_final = (fast_feat + slow_feat) / 2
+            ROIalign_logits = self._compute_similarity(roi_feat_final, text_feats)
         elif pooling_type == "sparse":
-            roi_feat = self._roi_align(coordinate,clip_feat + 1e-4,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+            roi_feat = self._roi_align(coordinate, clip_feat + 1e-4, mask,
+                                       self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
             step = int(self.ROIalign_size // 4)
-            slow_feat = roi_feat[:,:,::step,:].mean(dim=2) # [b,q,d]
-            ROIalign_logits = self._compute_similarity(slow_feat,text_feats)
+            slow_feat = roi_feat[:, :, ::step, :].mean(dim=2)  # [b,q,d]
+            ROIalign_logits = self._compute_similarity(slow_feat, text_feats)
         else:
             raise ValueError
 
-        return ROIalign_logits   
+        return ROIalign_logits
 
     def forward(self, samples: NestedTensor, classes_name, description_dict, targets, epoch):
         """ The forward expects a NestedTensor, which consists of:
@@ -355,165 +364,179 @@ class ConditionalDETR(nn.Module):
 
         # origin CLIP features
         clip_feat, mask = samples.decompose()
-        bs,t,dim = clip_feat.shape
+        bs, t, dim = clip_feat.shape
 
         # backbone for temporal modeling
-        feature_list, pos = self.backbone(samples) # list of [b,t,c], list of [b,t,c]
+        feature_list, pos = self.backbone(samples)  # list of [b,t,c], list of [b,t,c]
 
+        text_feats = None
         # prepare text target
         if self.target_type != "none":
             with torch.no_grad():
                 if self.args.feature_type == "ViFi-CLIP":
-                    text_feats = torch.from_numpy(np.load(os.path.join(self.args.feature_path,'text_features_split75_splitID1.npy'))).float().to(self.device)
+                    text_feats = torch.from_numpy(
+                        np.load(os.path.join(self.args.feature_path, 'text_features_split75_splitID1.npy'))).float().to(
+                        self.device)
                 elif self.args.feature_type == "CLIP":
-                    text_feats = self.get_text_feats(classes_name, description_dict, self.device, self.target_type) # [N classes,dim]
+                    text_feats = self.get_text_feats(classes_name, description_dict, self.device,
+                                                     self.target_type)  # [N classes,dim]
                 else:
                     raise NotImplementedError
 
-                
         # feed into model
         src, mask = feature_list[-1].decompose()
         assert mask is not None
-        src = self.input_proj(src.permute(0,2,1)).permute(0,2,1)
-        
-        memory, hs, reference = self.transformer(src, mask, self.query_embed.weight, pos[-1]) # [enc_layers, b,t,c], [dec_layers,b,num_queries,c], [b,num_queries,1]
+        src = self.input_proj(src.permute(0, 2, 1)).permute(0, 2, 1)
+
+        inst_queries = self.inst_content_embed.weight
+        start_queries = self.start_content_embed.weight
+        end_queries = self.end_content_embed.weight
+
+        memory, inst_hs, start_hs, end_hs, reference, enc_dense_logits, enc_dense_boxes = self.transformer(
+            src,
+            mask,
+            (inst_queries, start_queries, end_queries),
+            self.query_pos.weight,
+            pos[-1],
+            text_feat=text_feats,
+        )
 
         # record result
         out = {}
         out['memory'] = memory
-        out['hs'] = hs
-
-        # #  For computing ACC use ###
-        # # compute the classification accuate of CLIP
-        # # prepare instance coordination
-        # gt_roi_feat = [] 
-        # gt_labels = []
-        # for i, t in enumerate(targets):
-        #     if len(t['segments']) > 0 :
-        #         gt_coordinations = t['segments'].unsqueeze(0) # [1,num_instance,2]->"center,width"
-        #         visual_feat_i = clip_feat[i].unsqueeze(0) # [1,T,dim]
-        #         mask_i = mask[i].unsqueeze(0) # [1,T]
-        #         roi_feat = self._roi_align(gt_coordinations,visual_feat_i,mask_i,self.ROIalign_size).squeeze(dim=0) # [1,num_instance,ROIalign_size,dim]->[num_instance,ROIalign_size,dim]
-        #         gt_roi_feat.append(roi_feat)
-        #         gt_lbl = t['semantic_labels'] # [num]
-        #         gt_labels.append(gt_lbl)
-        # if len(gt_labels) > 0:
-        #     gt_roi_feat = torch.cat(gt_roi_feat,dim=0) # [batch_instance_num,ROIalign_size,dim]
-        #     gt_roi_feat = gt_roi_feat.mean(dim=1) # [batch_instance_num,dim]
-        #     gt_labels = torch.cat(gt_labels,dim=0) # [batch_instance_num]
-
-        #     gt_logits = self._compute_similarity(gt_roi_feat,text_feats) # [batch_instance_num,num_classes]
-            
-        #     out['gt_labels'] = gt_labels
-        #     out['gt_logits'] = gt_logits
-        # #  For computing ACC use ###
+        out['hs'] = torch.cat([inst_hs, start_hs, end_hs], dim=-1)
+        out['dense_class_logits'] = enc_dense_logits  # [bs, T, 1]
+        out['dense_pred_boxes'] = enc_dense_boxes  # [bs, T, 2]
 
         # generate the salient gt
         if self.salient_loss:
-            if self.training: # only generate gt in training phase
-                salient_gt = torch.zeros((bs,t),device=self.device) # [bs,t]
-                salient_loss_mask = mask.clone() # [bs,t]
+            if self.training:  # only generate gt in training phase
+                salient_gt = torch.zeros((bs, t), device=self.device)  # [bs,t]
+                salient_loss_mask = mask.clone()  # [bs,t]
 
                 for i, tgt in enumerate(targets):
-                    salient_mask = tgt['salient_mask'] # [num_tgt,T]
+                    salient_mask = tgt['salient_mask']  # [num_tgt,T]
                     # padding the salient mask
                     num_to_pad = t - salient_mask.shape[1]
                     if num_to_pad > 0:
-                        padding = torch.ones((salient_mask.shape[0], num_to_pad), dtype=torch.bool, device=salient_mask.device)
+                        padding = torch.ones((salient_mask.shape[0], num_to_pad), dtype=torch.bool,
+                                             device=salient_mask.device)
                         salient_mask = torch.cat((salient_mask, padding), dim=1)
 
                     for salient_mask_j in salient_mask:
-                        salient_gt[i,:] = (salient_gt[i,:] + (~salient_mask_j).float()).clamp(0,1)
-
+                        salient_gt[i, :] = (salient_gt[i, :] + (~salient_mask_j).float()).clamp(0, 1)
 
                 out['salient_gt'] = salient_gt
                 out['salient_loss_mask'] = salient_loss_mask
-            
-            salient_logits = self.salient_head(memory[-1].permute(0,2,1)).permute(0,2,1) # [b,t,1]
-            out['salient_logits'] = salient_logits
-        
 
+            salient_logits = self.salient_head(memory[-1].permute(0, 2, 1)).permute(0, 2, 1)  # [b,t,1]
+            out['salient_logits'] = salient_logits
+
+        inst_feat = inst_hs[-1]
+        start_feat = start_hs[-1]
+        end_feat = end_hs[-1]
+        reference_before_sigmoid = inverse_sigmoid(reference)
+
+        inst_delta = self.inst_bbox_embed(inst_feat)
+        cw_logits = inst_delta + reference_before_sigmoid
+        cw_pred = cw_logits.sigmoid()
+
+        start_base = (cw_pred[..., :1] - cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+        end_base = (cw_pred[..., :1] + cw_pred[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+
+        start_logits = inverse_sigmoid(start_base) + self.start_bbox_embed(start_feat)
+        end_logits = inverse_sigmoid(end_base) + self.end_bbox_embed(end_feat)
+
+        start_pred = start_logits.sigmoid()
+        end_pred = end_logits.sigmoid()
+        width_pred = (end_pred - start_pred).clamp(min=1e-6)
+        center_pred = ((end_pred + start_pred) / 2).clamp(0, 1)
+        pred_boxes = torch.cat([center_pred, width_pred], dim=-1)
+
+        fused_feat_last = torch.cat([inst_feat, start_feat, end_feat], dim=-1)
 
         # refine encoder
         if self.enable_refine:
             with torch.no_grad():
-                reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-                tmp = self.bbox_embed(hs[-1]) # [b,num_queries,2], tmp is the predicted offset value.
-                tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-                outputs_coord = tmp.sigmoid() # [b,num_queries,2]
-                roi_pos = self._roi_align(outputs_coord,pos[-1],mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
-                roi_feat = self._roi_align(outputs_coord,clip_feat,mask,self.ROIalign_size) # [bs,num_queries,ROIalign_size,dim]
+                roi_pos = self._roi_align(pred_boxes, pos[-1], mask,
+                                          self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
+                roi_feat = self._roi_align(pred_boxes, clip_feat, mask,
+                                           self.ROIalign_size)  # [bs,num_queries,ROIalign_size,dim]
 
-            b,q,l,d = roi_feat.shape
-            refine_hs = self.refine_decoder(hs[-1],clip_feat,roi_feat,
-                                    video_feat_key_padding_mask=mask,
-                                    video_pos=pos[-1],
-                                    roi_pos=roi_pos)
+            b, q, l, d = roi_feat.shape
+            refine_hs = self.refine_decoder(fused_feat_last, clip_feat, roi_feat,
+                                            video_feat_key_padding_mask=mask,
+                                            video_pos=pos[-1],
+                                            roi_pos=roi_pos)
 
-            refine_hs = hs[-1] + refine_hs
-            reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-            tmp = self.bbox_embed(refine_hs) # [b,num_queries,2], tmp is the predicted offset value.
-            tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-            outputs_coord_refined = tmp.sigmoid() # [b,num_queries,2]
+            refine_hs = fused_feat_last + refine_hs
+            inst_refine, start_refine, end_refine = torch.split(refine_hs,
+                                                                [self.inst_dim, self.boundary_dim, self.boundary_dim],
+                                                                dim=-1)
+
+            inst_delta_refine = self.inst_bbox_embed(inst_refine)
+            cw_logits_refine = inst_delta_refine + reference_before_sigmoid
+            cw_pred_refine = cw_logits_refine.sigmoid()
+
+            start_base_refine = (cw_pred_refine[..., :1] - cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+            end_base_refine = (cw_pred_refine[..., :1] + cw_pred_refine[..., 1:2] / 2).clamp(1e-6, 1 - 1e-6)
+
+            start_logits_refine = inverse_sigmoid(start_base_refine) + self.start_bbox_embed(start_refine)
+            end_logits_refine = inverse_sigmoid(end_base_refine) + self.end_bbox_embed(end_refine)
+
+            start_pred_refine = start_logits_refine.sigmoid()
+            end_pred_refine = end_logits_refine.sigmoid()
+            width_pred_refine = (end_pred_refine - start_pred_refine).clamp(min=1e-6)
+            center_pred_refine = ((end_pred_refine + start_pred_refine) / 2).clamp(0, 1)
+
+            outputs_coord_refined = torch.cat([center_pred_refine, width_pred_refine], dim=-1)
             out['pred_boxes'] = outputs_coord_refined
 
             if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
                 # compute the class-agnostic foreground score
-                actionness_logits = self.actionness_embed(refine_hs) # [b,num_queries,2]
+                actionness_logits = self.actionness_embed(refine_hs)  # [b,num_queries,2]
                 out['actionness_logits'] = actionness_logits
 
             if not self.eval_proposal and not self.enable_classAgnostic:
                 if self.target_type != "none":
-                    class_emb = self.class_embed(refine_hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,dim]
-                    b,n,dim = class_emb.shape
-                    class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
+                    class_emb = self.class_embed(refine_hs)  # [dec_layers,b,num_queries,dim]->[b,num_queries,dim]
+                    b, n, dim = class_emb.shape
+                    class_logits = self._compute_similarity(class_emb, text_feats)  # [b,num_queries,num_classes]
                 else:
-                    class_logits = self.class_embed(hs) # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
+                    class_logits = self.class_embed(
+                        refine_hs)  # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
                 out['class_logits'] = class_logits
 
 
         else:
-            reference_before_sigmoid = inverse_sigmoid(reference) # [b,num_queries,1], Reference point is the predicted center point.
-            outputs_coords = []
-            for lvl in range(hs.shape[0]):
-                tmp = self.bbox_embed(hs[lvl]) # [b,num_queries,2], tmp is the predicted offset value.
-                tmp[..., :1] += reference_before_sigmoid # [b,num_queries,2], only the center coordination add reference point
-                outputs_coord = tmp.sigmoid() # [b,num_queries,2]
-                outputs_coords.append(outputs_coord)
-            outputs_coord = torch.stack(outputs_coords) # [dec_layers,b,num_queries,2]
-            out['pred_boxes'] = outputs_coord[-1]
+            out['pred_boxes'] = pred_boxes
 
             if self.actionness_loss or self.eval_proposal or self.enable_classAgnostic:
                 # compute the class-agnostic foreground score
-                actionness_logits = self.actionness_embed(hs)[-1] # [dec_layers,b,num_queries,1]->[b,num_queries,2]
+                actionness_logits = self.actionness_embed(fused_feat_last)
                 out['actionness_logits'] = actionness_logits
-        
 
             if not self.eval_proposal and not self.enable_classAgnostic:
                 if self.target_type != "none":
-                    class_emb = self.class_embed(hs)[-1] # [dec_layers,b,num_queries,dim]->[b,num_queries,dim]
-                    b,n,dim = class_emb.shape
-                    class_logits = self._compute_similarity(class_emb, text_feats) # [b,num_queries,num_classes]
+                    class_emb = self.class_embed(fused_feat_last)
+                    b, n, dim = class_emb.shape
+                    class_logits = self._compute_similarity(class_emb, text_feats)  # [b,num_queries,num_classes]
                 else:
-                    class_logits = self.class_embed(hs)[-1] # [dec_layers,b,num_queries,dim]->[b,num_queries,num_classes]
+                    class_logits = self.class_embed(fused_feat_last)
                 out['class_logits'] = class_logits
 
-
         # obtain the ROIalign logits
-        if not self.training: # only in inference stage
-            
+        if not self.training:  # only in inference stage
 
             if self.enable_classAgnostic:
-                # fixed_text_feats = self.get_text_feats(classes_name, description_dict, self.device, self.target_type) # [N classes,dim]
+                ROIalign_logits = self._temporal_pooling(self.pooling_type, out['pred_boxes'], clip_feat, mask,
+                                                         self.ROIalign_size, text_feats)
 
-                ROIalign_logits = self._temporal_pooling(self.pooling_type, out['pred_boxes'], clip_feat, mask, self.ROIalign_size, text_feats)
-                
-                out['class_logits'] = ROIalign_logits 
+                out['class_logits'] = ROIalign_logits
             elif self.eval_proposal:
                 pass
             else:
                 assert "class_logits" in out, "please check the code of self.class_embed"
-            
 
         return out
 
@@ -525,19 +548,17 @@ class ConditionalDETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
-
-
-
 def build(args, device):
-    if args.target_type != "none": # adopt one-hot as target, only used in close_set
+    if args.target_type != "none":  # adopt one-hot as target, only used in close_set
         num_classes = int(args.num_classes * args.split / 100)
     else:
         num_classes = args.num_classes
 
     if args.feature_type == "ViFi-CLIP":
-        text_encoder,logit_scale = None, torch.from_numpy(np.load(os.path.join(args.feature_path,'logit_scale.npy'))).float()
+        text_encoder, logit_scale = None, torch.from_numpy(
+            np.load(os.path.join(args.feature_path, 'logit_scale.npy'))).float()
     elif args.feature_type == "CLIP":
-        text_encoder, logit_scale = build_text_encoder(args,device)
+        text_encoder, logit_scale = build_text_encoder(args, device)
     else:
         raise NotImplementedError
     backbone = build_backbone(args)
@@ -562,7 +583,10 @@ def build(args, device):
 
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
-    
+    weight_dict['loss_dense_ce'] = args.cls_loss_coef
+    weight_dict['loss_dense_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_dense_giou'] = args.giou_loss_coef
+
     if args.actionness_loss or args.eval_proposal or args.enable_classAgnostic:
         weight_dict['loss_actionness'] = args.actionness_loss_coef
     if args.salient_loss:
@@ -574,7 +598,7 @@ def build(args, device):
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-    
+
     criterion = build_criterion(args, num_classes, matcher=matcher, weight_dict=weight_dict)
     criterion.to(device)
 
