@@ -889,7 +889,6 @@ def _get_activation_fn(activation):
         return F.glu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
-
 if __name__ == "__main__":
     import sys
 
